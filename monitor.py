@@ -181,11 +181,14 @@ def send_sms(body):
     if not (sid and token and frm and to):
         print("SMS not configured, skipping.")
         return
-    from twilio.rest import Client
-    client = Client(sid, token)
-    for num in to:
-        client.messages.create(body=body, from_=frm, to=num)
-        print(f"SMS sent to {num}")
+    try:
+        from twilio.rest import Client
+        client = Client(sid, token)
+        for num in to:
+            client.messages.create(body=body, from_=frm, to=num)
+            print(f"SMS sent to {num}")
+    except Exception as e:
+        print(f"SMS send failed (continuing): {e}")
 
 
 def send_email(subject, body):
@@ -202,11 +205,14 @@ def send_email(subject, body):
     msg["Subject"] = subject
     msg["From"] = frm
     msg["To"] = ", ".join(to)
-    with smtplib.SMTP(host, port) as server:
-        server.starttls()
-        server.login(user, pw)
-        server.sendmail(frm, to, msg.as_string())
-    print(f"Email sent to {', '.join(to)}")
+    try:
+        with smtplib.SMTP(host, port) as server:
+            server.starttls()
+            server.login(user, pw)
+            server.sendmail(frm, to, msg.as_string())
+        print(f"Email sent to {', '.join(to)}")
+    except Exception as e:
+        print(f"Email send failed (continuing): {e}")
 
 
 def conditions_line(cur):
