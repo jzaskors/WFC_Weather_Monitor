@@ -2,15 +2,14 @@ name: WFC Weather Monitor
 
 on:
   schedule:
-    # Every 10 minutes. GitHub may delay scheduled runs under load (best-effort).
     - cron: "*/10 * * * *"
-  workflow_dispatch:        # lets you run it manually from the Actions tab to test
+  workflow_dispatch:
 
 permissions:
-  contents: write           # needed to commit state.json back to the repo
+  contents: write
 
 concurrency:
-  group: weather-monitor    # never run two checks at once
+  group: weather-monitor
   cancel-in-progress: false
 
 jobs:
