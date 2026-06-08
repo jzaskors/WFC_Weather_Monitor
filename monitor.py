@@ -28,8 +28,9 @@ TZ = ZoneInfo("America/New_York")
 # Only alert during operating hours (24h clock, local time)
 OPEN_HOUR, CLOSE_HOUR = 7, 20
 
-# Also alert when status enters CAUTION (not just HALT)? Usually noisy -> False
-ALERT_ON_CAUTION = true
+# Also alert when status enters CAUTION (not just HALT)? True = yes, you'll get
+# a heads-up at CAUTION and a second alert if it escalates to HALT.
+ALERT_ON_CAUTION = True
 
 THRESHOLDS = {
     "paddle": {"windCaution": 12, "windStop": 16, "gustCaution": 16, "gustStop": 20,
@@ -256,34 +257,40 @@ def main():
     new_state = {}
     ts = now.strftime("%-I:%M %p")
 
-    def alert_level(lvl):
+    def is_alert(lvl):
         return lvl == "STOP" or (ALERT_ON_CAUTION and lvl == "CAUTION")
 
     for act in ("paddle", "sail"):
         level, reasons = evaluate(act, cur, alert_stop)
         new_state[act] = level
         was, name = prev.get(act, "GO"), LABELS[act]
-        rlist = [r for _, r in reasons if ORDER[_] >= ORDER["STOP"]] or [r for _, r in reasons]
+        # reasons at the current (top) severity, so a CAUTION note lists caution reasons
+        rlist = [r for l, r in reasons if ORDER[l] == ORDER[level]] or [r for _, r in reasons]
 
-        # transition INTO an alert level
-        if alert_level(level) and not alert_level(was):
+        # Notify when entering an alert level OR escalating to a higher one
+        # (GO->CAUTION, GO->STOP, CAUTION->STOP). All-clear when fully back to GO.
+        if is_alert(level) and (not is_alert(was) or ORDER[level] > ORDER[was]):
+            if level == "STOP":
+                tag, lead = "⚠️ WFC HALT", f"Halt {name} at West Harbor as of {ts}."
+            else:
+                tag, lead = "🟡 WFC CAUTION", (f"Use caution for {name} at West Harbor as of {ts} "
+                                              "— conditions are approaching limits.")
             why = "; ".join(rlist[:3])
-            send_sms(f"⚠️ WFC HALT — {name}. {why}. ({ts}) {conditions_line(cur)}")
+            send_sms(f"{tag} — {name}. {why}. ({ts}) {conditions_line(cur)}")
             send_email(
-                f"⚠️ WFC HALT — {name}",
-                f"Halt {name} at West Harbor as of {ts}.\n\n"
-                f"Reasons:\n" + "\n".join(f"  • {r}" for r in rlist) +
+                f"{tag} — {name}",
+                f"{lead}\n\nReasons:\n" + "\n".join(f"  • {r}" for r in rlist) +
                 f"\n\nConditions: {conditions_line(cur)}\n"
                 + (f"NWS alerts: {', '.join(set(alerts))}\n" if alerts else "")
                 + "\nThis is forecast/observation-based. Confirm lightning by eye/ear (30-30 rule)."
             )
-            print(f"ALERT: {name} -> {level}")
-        # transition back to all-clear
-        elif not alert_level(level) and alert_level(was):
+            print(f"ALERT: {name} {was} -> {level}")
+        # transition back to fully clear
+        elif not is_alert(level) and is_alert(was):
             send_sms(f"✅ WFC CLEAR — {name} OK. ({ts}) {conditions_line(cur)}")
             send_email(f"✅ WFC CLEAR — {name}",
                        f"{name} cleared to operate as of {ts}.\n\nConditions: {conditions_line(cur)}")
-            print(f"ALL CLEAR: {name} -> {level}")
+            print(f"ALL CLEAR: {name} {was} -> {level}")
         else:
             print(f"{name}: {was} -> {level} (no change in alert state)")
 
