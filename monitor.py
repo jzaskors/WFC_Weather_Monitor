@@ -29,7 +29,7 @@ TZ = ZoneInfo("America/New_York")
 OPEN_HOUR, CLOSE_HOUR = 7, 20
 
 # Also alert when status enters CAUTION (not just HALT)? Usually noisy -> False
-ALERT_ON_CAUTION = False
+ALERT_ON_CAUTION = true
 
 THRESHOLDS = {
     "paddle": {"windCaution": 12, "windStop": 16, "gustCaution": 16, "gustStop": 20,
