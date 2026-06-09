@@ -78,30 +78,106 @@ def wx_text(c):
 
 
 # ----------------------------------------------------------------------------
-# Fetch
+# Fetch  (multi-model: HRRR primary, ICON + ECMWF for agreement / fallback)
 # ----------------------------------------------------------------------------
-def fetch_conditions():
-    fc = ("https://api.open-meteo.com/v1/forecast"
-          f"?latitude={LAT}&longitude={LON}"
-          "&current=temperature_2m,precipitation,weather_code,wind_speed_10m,"
-          "wind_direction_10m,wind_gusts_10m,cape,visibility"
-          "&wind_speed_unit=kn&temperature_unit=fahrenheit&precipitation_unit=inch"
-          "&timezone=America%2FNew_York")
-    mar = ("https://marine-api.open-meteo.com/v1/marine"
-           f"?latitude={LAT}&longitude={LON}"
-           "&current=wave_height,sea_surface_temperature&timezone=America%2FNew_York")
-    nws = f"https://api.weather.gov/alerts/active?point={LAT},{LON}"
+# Open-Meteo model IDs. HRRR (ncep_hrrr_conus) is the high-res US short-range
+# model — best for the harbor inside ~2 days. ICON + ECMWF are the cross-check
+# and the fallback if HRRR has a coverage/run gap.
+MODELS = {"HRRR": "ncep_hrrr_conus", "ICON": "icon_seamless", "ECMWF": "ecmwf_ifs025"}
+CUR_FIELDS = ("temperature_2m,precipitation,weather_code,wind_speed_10m,"
+              "wind_direction_10m,wind_gusts_10m,cape,visibility")
+SRC_LABEL = {"HRRR": "HRRR 3 km", "ICON": "ICON", "ECMWF": "ECMWF 9 km",
+             "best-match": "global best-match (HRRR unavailable)"}
 
-    f = requests.get(fc, timeout=20).json()
-    c = f["current"]
 
+def _pick(d, base):
+    """Return d[base], tolerating model-suffixed keys
+    (e.g. wind_speed_10m_ncep_hrrr_conus) that appear when models= is used."""
+    if d.get(base) is not None:
+        return d[base]
+    for k, v in d.items():
+        if (k == base or k.startswith(base + "_")) and v is not None:
+            return v
+    return None
+
+
+def _forecast_url(model_id=None):
+    url = ("https://api.open-meteo.com/v1/forecast"
+           f"?latitude={LAT}&longitude={LON}&current={CUR_FIELDS}"
+           "&wind_speed_unit=kn&temperature_unit=fahrenheit&precipitation_unit=inch"
+           "&timezone=America%2FNew_York")
+    return url + (f"&models={model_id}" if model_id else "")
+
+
+def _parse_current(c):
+    vis = _pick(c, "visibility")
+    return {
+        "temp": _pick(c, "temperature_2m"),
+        "precip": _pick(c, "precipitation"),
+        "weatherCode": _pick(c, "weather_code"),
+        "wind": _pick(c, "wind_speed_10m"),
+        "dir": _pick(c, "wind_direction_10m"),
+        "gust": _pick(c, "wind_gusts_10m"),
+        "cape": _pick(c, "cape"),
+        "visMi": vis / 1609.34 if vis is not None else None,
+    }
+
+
+def _fetch_model(model_id):
     try:
-        m = requests.get(mar, timeout=20).json().get("current", {})
+        c = requests.get(_forecast_url(model_id), timeout=20).json().get("current", {}) or {}
+        return _parse_current(c)
+    except Exception as e:
+        print(f"model {model_id} fetch failed: {e}")
+        return None
+
+
+def assess_agreement(model_winds):
+    """Confidence based on how closely the models agree on sustained wind."""
+    if len(model_winds) < 2:
+        return {"level": "SINGLE-SOURCE", "spread": None, "winds": model_winds}
+    spread = max(model_winds.values()) - min(model_winds.values())
+    level = "HIGH" if spread <= 3 else "MODERATE" if spread <= 6 else "LOW"
+    return {"level": level, "spread": spread, "winds": model_winds}
+
+
+def agreement_line(ag):
+    if ag["level"] == "SINGLE-SOURCE":
+        return "Model confidence: single-source (cross-check unavailable)"
+    parts = ", ".join(f"{n} {w}" for n, w in ag["winds"].items())
+    return f"Model agreement: {ag['level']} (spread {ag['spread']} kn — {parts})"
+
+
+def fetch_conditions():
+    # Pull each model independently so one failing can't break the others
+    runs = {name: _fetch_model(mid) for name, mid in MODELS.items()}
+
+    # Primary = HRRR; fall back through ICON, ECMWF, then global best-match
+    primary, source = None, None
+    for name in ("HRRR", "ICON", "ECMWF"):
+        r = runs.get(name)
+        if r and r["wind"] is not None:
+            primary, source = r, name
+            break
+    if primary is None:
+        try:
+            c = requests.get(_forecast_url(), timeout=20).json().get("current", {})
+            primary, source = _parse_current(c), "best-match"
+        except Exception as e:
+            raise RuntimeError(f"All weather-model fetches failed: {e}")
+
+    # Marine (waves / SST) and NWS alerts
+    try:
+        mar = ("https://marine-api.open-meteo.com/v1/marine"
+               f"?latitude={LAT}&longitude={LON}"
+               "&current=wave_height,sea_surface_temperature&timezone=America%2FNew_York")
+        m = requests.get(mar, timeout=20).json().get("current", {}) or {}
     except Exception:
         m = {}
 
     alerts = []
     try:
+        nws = f"https://api.weather.gov/alerts/active?point={LAT},{LON}"
         a = requests.get(nws, timeout=20,
                          headers={"User-Agent": "WFC-weather-monitor (ops@thewaterfrontcenter.org)"}).json()
         alerts = [feat["properties"]["event"] for feat in a.get("features", [])
@@ -109,22 +185,18 @@ def fetch_conditions():
     except Exception:
         pass
 
-    vis = c.get("visibility")
     wave = m.get("wave_height")
     sst = m.get("sea_surface_temperature")
-    return {
-        "temp": c.get("temperature_2m"),
-        "precip": c.get("precipitation"),
-        "weatherCode": c.get("weather_code"),
-        "storm": is_storm(c.get("weather_code")),
-        "wind": c.get("wind_speed_10m"),
-        "dir": c.get("wind_direction_10m"),
-        "gust": c.get("wind_gusts_10m"),
-        "cape": c.get("cape"),
-        "visMi": vis / 1609.34 if vis is not None else None,
+    cur = {
+        **primary,
+        "storm": is_storm(primary["weatherCode"]),
         "waveFt": wave * 3.281 if wave is not None else None,
         "sst": sst * 9 / 5 + 32 if sst is not None else None,
-    }, alerts
+        "source": source,
+    }
+
+    model_winds = {n: round(r["wind"]) for n, r in runs.items() if r and r["wind"] is not None}
+    return cur, alerts, assess_agreement(model_winds)
 
 
 # ----------------------------------------------------------------------------
@@ -248,10 +320,12 @@ def main():
         print(f"Outside operating hours ({now:%H:%M}); state reset, no alerts.")
         return
 
-    cur, alerts = fetch_conditions()
+    cur, alerts, agreement = fetch_conditions()
     stop_events = ("Thunderstorm", "Tornado", "Special Marine", "Marine Warning",
                    "Hurricane", "Tropical Storm", "Gale", "Storm Warning")
     alert_stop = any(any(k in a for k in stop_events) for a in alerts)
+    src = SRC_LABEL.get(cur.get("source"), cur.get("source"))
+    print(f"Primary model: {src} | {agreement_line(agreement)}")
 
     prev = load_state()
     new_state = {}
@@ -276,11 +350,14 @@ def main():
                 tag, lead = "🟡 WFC CAUTION", (f"Use caution for {name} at West Harbor as of {ts} "
                                               "— conditions are approaching limits.")
             why = "; ".join(rlist[:3])
-            send_sms(f"{tag} — {name}. {why}. ({ts}) {conditions_line(cur)}")
+            conf = agreement["level"]
+            send_sms(f"{tag} — {name}. {why}. ({ts}) {conditions_line(cur)} [{conf} conf]")
             send_email(
                 f"{tag} — {name}",
                 f"{lead}\n\nReasons:\n" + "\n".join(f"  • {r}" for r in rlist) +
                 f"\n\nConditions: {conditions_line(cur)}\n"
+                f"Primary model: {src}\n"
+                f"{agreement_line(agreement)}\n"
                 + (f"NWS alerts: {', '.join(set(alerts))}\n" if alerts else "")
                 + "\nThis is forecast/observation-based. Confirm lightning by eye/ear (30-30 rule)."
             )
