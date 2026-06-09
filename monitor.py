@@ -35,8 +35,8 @@ ALERT_ON_CAUTION = True
 THRESHOLDS = {
     "paddle": {"windCaution": 12, "windStop": 16, "gustCaution": 16, "gustStop": 20,
                "offWindCaution": 8, "offWindStop": 13},
-    "sail":   {"windCaution": 16, "windStop": 22, "gustCaution": 22, "gustStop": 28},
-    "shared": {"rainCaution": 0.10, "rainStop": 0.30, "capeWatch": 1000, "visStopMi": 0.5},
+    "sail":   {"windCaution": 16, "windStop": 20, "gustCaution": 22, "gustStop": 25},
+    "shared": {"rainCaution": 0.25, "rainStop": 0.35, "capeWatch": 1100, "visStopMi": 0.5},
     # Offshore wind arc (degrees the wind blows FROM). North-facing launch -> S/SW = offshore.
     "offshoreArc": {"from": 150, "to": 240},
 }
