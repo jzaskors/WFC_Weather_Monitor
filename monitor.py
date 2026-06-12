@@ -36,7 +36,7 @@ THRESHOLDS = {
     "paddle": {"windCaution": 12, "windStop": 16, "gustCaution": 16, "gustStop": 20,
                "offWindCaution": 8, "offWindStop": 13},
     "sail":   {"windCaution": 16, "windStop": 22, "gustCaution": 22, "gustStop": 28},
-    "shared": {"rainCaution": 0.15, "rainStop": 0.30, "capeWatch": 1250, "visStopMi": 0.5},
+    "shared": {"rainCaution": 0.10, "rainStop": 0.30, "capeWatch": 1000, "visStopMi": 0.5},
     # Offshore wind arc (degrees the wind blows FROM). North-facing launch -> S/SW = offshore.
     "offshoreArc": {"from": 150, "to": 240},
 }
@@ -290,7 +290,7 @@ def fetch_conditions():
 # ----------------------------------------------------------------------------
 # Decision engine (mirrors dashboard evalActivity)
 # ----------------------------------------------------------------------------
-def evaluate(activity, cur, alert_stop, thresholds=None):
+def evaluate(activity, cur, alert_stop, thresholds=None, alert_caution=False):
     reasons, level = [], "GO"
     th = thresholds or THRESHOLDS
 
@@ -305,6 +305,8 @@ def evaluate(activity, cur, alert_stop, thresholds=None):
         bump("STOP", "Thunderstorm overhead — clear the water")
     if alert_stop:
         bump("STOP", "Active NWS marine/storm warning")
+    if alert_caution:
+        bump("CAUTION", "Severe thunderstorm watch/warning in effect — monitor radar closely")
     if cur["precip"] is not None and cur["precip"] >= s["rainStop"]:
         bump("STOP", f"Heavy rain ({cur['precip']:.2f} in/hr)")
     elif cur["precip"] is not None and cur["precip"] >= s["rainCaution"]:
@@ -411,9 +413,15 @@ def main():
 
     cur, alerts, agreement = fetch_conditions()
     obs = fetch_observations()
-    stop_events = ("Thunderstorm", "Tornado", "Special Marine", "Marine Warning",
+    # NWS alert routing: thunderstorm watches/warnings -> CAUTION (your eyes + radar
+    # make the call); the rest remain hard HALTs. A storm actually overhead
+    # (weather code / observation) still forces HALT separately.
+    stop_events = ("Tornado", "Special Marine", "Marine Warning",
                    "Hurricane", "Tropical Storm", "Gale", "Storm Warning")
+    caution_events = ("Thunderstorm",)
     alert_stop = any(any(k in a for k in stop_events) for a in alerts)
+    alert_caution = (not alert_stop and
+                     any(any(k in a for k in caution_events) for a in alerts))
     src = SRC_LABEL.get(cur.get("source"), cur.get("source"))
     print(f"Primary model: {src} | {agreement_line(agreement)}")
     print(obs_line(obs))
@@ -426,7 +434,7 @@ def main():
         return lvl == "STOP" or (ALERT_ON_CAUTION and lvl == "CAUTION")
 
     for act in ("paddle", "sail"):
-        f_level, f_reasons = evaluate(act, cur, alert_stop)
+        f_level, f_reasons = evaluate(act, cur, alert_stop, alert_caution=alert_caution)
         o_level, o_reasons = evaluate_observed(act, obs)
         # Worst case wins: a measured exceedance forces the alert even if models say calm
         level = f_level if ORDER[f_level] >= ORDER[o_level] else o_level
