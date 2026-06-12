@@ -35,8 +35,8 @@ ALERT_ON_CAUTION = True
 THRESHOLDS = {
     "paddle": {"windCaution": 12, "windStop": 16, "gustCaution": 16, "gustStop": 20,
                "offWindCaution": 8, "offWindStop": 13},
-    "sail":   {"windCaution": 16, "windStop": 20, "gustCaution": 22, "gustStop": 25},
-    "shared": {"rainCaution": 0.25, "rainStop": 0.35, "capeWatch": 1100, "visStopMi": 0.5},
+    "sail":   {"windCaution": 16, "windStop": 22, "gustCaution": 22, "gustStop": 28},
+    "shared": {"rainCaution": 0.10, "rainStop": 0.30, "capeWatch": 1000, "visStopMi": 0.5},
     # Offshore wind arc (degrees the wind blows FROM). North-facing launch -> S/SW = offshore.
     "offshoreArc": {"from": 150, "to": 240},
 }
@@ -148,6 +148,94 @@ def agreement_line(ag):
     return f"Model agreement: {ag['level']} (spread {ag['spread']} kn — {parts})"
 
 
+# ----------------------------------------------------------------------------
+# Real-time observations (NDBC). These are MEASURED conditions, not forecasts.
+# 44040 (WLIS buoy, ~5 nm N in the Sound) is closest but intermittent;
+# KPTN6 (Kings Point NOAA station, ~11 mi WSW) is the reliable fallback.
+# ----------------------------------------------------------------------------
+OBS_STATIONS = [("44040", "WLIS buoy (5 nm N)"), ("KPTN6", "Kings Point (11 mi WSW)")]
+OBS_MAX_AGE_MIN = 90          # ignore observations older than this
+MS_TO_KN = 1.94384
+
+
+def fetch_observations():
+    """Return newest usable observation: {wind, gust, dir, station, age_min} in kn, or None."""
+    from datetime import timezone
+    for sid, label in OBS_STATIONS:
+        try:
+            txt = requests.get(f"https://www.ndbc.noaa.gov/data/realtime2/{sid}.txt",
+                               timeout=20).text
+            lines = [l for l in txt.splitlines() if l.strip() and not l.startswith("#")]
+            if not lines:
+                continue
+            # Standard met format: YY MM DD hh mm WDIR WSPD GST ... (UTC, m/s)
+            p = lines[0].split()
+            obs_time = datetime(int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4]),
+                                tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - obs_time).total_seconds() / 60
+            if age_min > OBS_MAX_AGE_MIN:
+                print(f"obs {sid}: stale ({age_min:.0f} min old), skipping")
+                continue
+
+            def num(v):
+                return None if v in ("MM", "") else float(v)
+
+            wdir, wspd, gust = num(p[5]), num(p[6]), num(p[7])
+            if wspd is None:
+                print(f"obs {sid}: wind missing, skipping")
+                continue
+            return {
+                "wind": wspd * MS_TO_KN,
+                "gust": gust * MS_TO_KN if gust is not None else None,
+                "dir": wdir,
+                "station": label,
+                "age_min": round(age_min),
+            }
+        except Exception as e:
+            print(f"obs {sid} fetch failed: {e}")
+    return None
+
+
+def obs_line(obs):
+    if not obs:
+        return "Observed: unavailable (no reporting station)"
+    g = f" g{round(obs['gust'])}" if obs["gust"] is not None else ""
+    return (f"Observed at {obs['station']}: {round(obs['wind'])} kn"
+            f"{g} {compass(obs['dir'])} ({obs['age_min']} min ago)")
+
+
+# Observation stations sit in more exposed water than the sheltered harbor, so
+# observed winds are judged against thresholds raised by this many knots.
+OBS_EXPOSURE_OFFSET_KN = 2
+
+_WIND_KEYS = ("windCaution", "windStop", "gustCaution", "gustStop",
+              "offWindCaution", "offWindStop")
+
+
+def _offset_thresholds(offset):
+    th = {k: (dict(v) if isinstance(v, dict) else v) for k, v in THRESHOLDS.items()}
+    for act in ("paddle", "sail"):
+        for k in _WIND_KEYS:
+            if k in th[act]:
+                th[act][k] = th[act][k] + offset
+    return th
+
+
+def evaluate_observed(activity, obs):
+    """Run MEASURED wind through thresholds raised by the exposure offset;
+    reasons tagged with station. Reported values stay the true measured ones."""
+    if not obs:
+        return "GO", []
+    cur = {"storm": False, "precip": None, "visMi": None, "cape": None,
+           "wind": obs["wind"], "dir": obs["dir"], "gust": obs["gust"]}
+    level, reasons = evaluate(activity, cur, False,
+                              thresholds=_offset_thresholds(OBS_EXPOSURE_OFFSET_KN))
+    tagged = [(l, f"{r} — MEASURED at {obs['station']} "
+                  f"(judged vs +{OBS_EXPOSURE_OFFSET_KN} kn exposure-adjusted limits)")
+              for l, r in reasons]
+    return level, tagged
+
+
 def fetch_conditions():
     # Pull each model independently so one failing can't break the others
     runs = {name: _fetch_model(mid) for name, mid in MODELS.items()}
@@ -202,8 +290,9 @@ def fetch_conditions():
 # ----------------------------------------------------------------------------
 # Decision engine (mirrors dashboard evalActivity)
 # ----------------------------------------------------------------------------
-def evaluate(activity, cur, alert_stop):
+def evaluate(activity, cur, alert_stop, thresholds=None):
     reasons, level = [], "GO"
+    th = thresholds or THRESHOLDS
 
     def bump(lvl, reason):
         nonlocal level
@@ -211,7 +300,7 @@ def evaluate(activity, cur, alert_stop):
         if ORDER[lvl] > ORDER[level]:
             level = lvl
 
-    s = THRESHOLDS["shared"]
+    s = th["shared"]
     if cur["storm"]:
         bump("STOP", "Thunderstorm overhead — clear the water")
     if alert_stop:
@@ -225,8 +314,8 @@ def evaluate(activity, cur, alert_stop):
     if cur["cape"] is not None and cur["cape"] >= s["capeWatch"]:
         bump("CAUTION", f"Unstable air (CAPE {round(cur['cape'])}) — storms possible")
 
-    t = THRESHOLDS[activity]
-    if activity == "paddle" and in_arc(cur["dir"], THRESHOLDS["offshoreArc"]["from"], THRESHOLDS["offshoreArc"]["to"]):
+    t = th[activity]
+    if activity == "paddle" and in_arc(cur["dir"], th["offshoreArc"]["from"], th["offshoreArc"]["to"]):
         if cur["wind"] is not None and cur["wind"] >= t["offWindStop"]:
             bump("STOP", f"Offshore wind {round(cur['wind'])} kn — pushes paddlers out")
         elif cur["wind"] is not None and cur["wind"] >= t["offWindCaution"]:
@@ -321,11 +410,13 @@ def main():
         return
 
     cur, alerts, agreement = fetch_conditions()
+    obs = fetch_observations()
     stop_events = ("Thunderstorm", "Tornado", "Special Marine", "Marine Warning",
                    "Hurricane", "Tropical Storm", "Gale", "Storm Warning")
     alert_stop = any(any(k in a for k in stop_events) for a in alerts)
     src = SRC_LABEL.get(cur.get("source"), cur.get("source"))
     print(f"Primary model: {src} | {agreement_line(agreement)}")
+    print(obs_line(obs))
 
     prev = load_state()
     new_state = {}
@@ -335,7 +426,11 @@ def main():
         return lvl == "STOP" or (ALERT_ON_CAUTION and lvl == "CAUTION")
 
     for act in ("paddle", "sail"):
-        level, reasons = evaluate(act, cur, alert_stop)
+        f_level, f_reasons = evaluate(act, cur, alert_stop)
+        o_level, o_reasons = evaluate_observed(act, obs)
+        # Worst case wins: a measured exceedance forces the alert even if models say calm
+        level = f_level if ORDER[f_level] >= ORDER[o_level] else o_level
+        reasons = f_reasons + o_reasons
         new_state[act] = level
         was, name = prev.get(act, "GO"), LABELS[act]
         # reasons at the current (top) severity, so a CAUTION note lists caution reasons
@@ -355,7 +450,8 @@ def main():
             send_email(
                 f"{tag} — {name}",
                 f"{lead}\n\nReasons:\n" + "\n".join(f"  • {r}" for r in rlist) +
-                f"\n\nConditions: {conditions_line(cur)}\n"
+                f"\n\nForecast: {conditions_line(cur)}\n"
+                f"{obs_line(obs)}\n"
                 f"Primary model: {src}\n"
                 f"{agreement_line(agreement)}\n"
                 + (f"NWS alerts: {', '.join(set(alerts))}\n" if alerts else "")
