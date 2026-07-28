@@ -17,6 +17,8 @@ import os
 import smtplib
 import sys
 from datetime import datetime
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
@@ -29,6 +31,15 @@ try:
 except Exception as _e:
     print(f"sagamore module unavailable ({_e}); using buoys only")
     fetch_sagamore = None
+
+# Conditions graphic for alert emails (render_conditions.py, needs Pillow).
+# If unavailable the alerts still send — just without the picture.
+try:
+    from render_conditions import render_conditions_png, fleet_status
+except Exception as _e:
+    print(f"render_conditions unavailable ({_e}); alerts will be text-only")
+    render_conditions_png = None
+    fleet_status = None
 
 # ----------------------------------------------------------------------------
 # SITE + THRESHOLDS  (keep in sync with the dashboard)
@@ -411,7 +422,49 @@ def send_sms(body):
         print(f"SMS send failed (continuing): {e}")
 
 
-def send_email(subject, body):
+LEVEL_HTML = {
+    "GO":      ("#2fa36b", "GO"),
+    "CAUTION": ("#b87400", "CAUTION"),
+    "STOP":    ("#c62828", "HALT"),
+}
+
+
+def fleet_table_html(rows):
+    """Fleet status as a real HTML table — always readable even when the
+    reader's mail client blocks images. This is the safety net, not decoration."""
+    out = ['<table cellpadding="0" cellspacing="0" border="0" '
+           'style="border-collapse:collapse;width:100%;max-width:460px;'
+           'font-family:Arial,Helvetica,sans-serif;font-size:14px;margin:8px 0 4px">']
+    out.append('<tr><th align="left" style="padding:6px 8px;border-bottom:2px solid #ccc;'
+               'font-size:11px;letter-spacing:.08em;color:#666">FLEET</th>'
+               '<th align="right" style="padding:6px 8px;border-bottom:2px solid #ccc;'
+               'font-size:11px;letter-spacing:.08em;color:#666">STATUS</th></tr>')
+    for label, lvl, why in rows:
+        color, word = LEVEL_HTML[lvl]
+        note = (f'<span style="color:#777;font-size:12px"> — {why}</span>') if why else ""
+        out.append(
+            f'<tr><td style="padding:7px 8px;border-bottom:1px solid #eee">'
+            f'<span style="display:inline-block;width:4px;height:13px;background:{color};'
+            f'vertical-align:-2px;margin-right:8px"></span>{label}{note}</td>'
+            f'<td align="right" style="padding:7px 8px;border-bottom:1px solid #eee;'
+            f'color:{color};font-weight:bold">{word}</td></tr>')
+    out.append("</table>")
+    return "".join(out)
+
+
+def fleet_table_text(rows):
+    """Plain-text fleet list for the non-HTML part of the message."""
+    lines = []
+    for label, lvl, why in rows:
+        word = LEVEL_HTML[lvl][1]
+        lines.append(f"  {label:<16} {word}" + (f"  ({why})" if why else ""))
+    return "\n".join(lines)
+
+
+def send_email(subject, body, html_body=None, image_png=None):
+    """Send the alert. If html_body is given the message is multipart:
+    plain text for clients that want it, HTML with the inline graphic for the
+    rest. The graphic is referenced as cid:conditions."""
     host = os.environ.get("SMTP_HOST")
     port = int(os.environ.get("SMTP_PORT", "587"))
     user = os.environ.get("SMTP_USER")
@@ -421,7 +474,23 @@ def send_email(subject, body):
     if not (host and user and pw and to):
         print("Email not configured, skipping.")
         return
-    msg = MIMEText(body)
+
+    if html_body:
+        outer = MIMEMultipart("related")
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body, "plain", "utf-8"))
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
+        outer.attach(alt)
+        if image_png:
+            img = MIMEImage(image_png, _subtype="png")
+            img.add_header("Content-ID", "<conditions>")
+            img.add_header("Content-Disposition", "inline",
+                           filename="wfc-conditions.png")
+            outer.attach(img)
+        msg = outer
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
+
     msg["Subject"] = subject
     msg["From"] = frm
     msg["To"] = ", ".join(to)
@@ -433,6 +502,40 @@ def send_email(subject, body):
         print(f"Email sent to {', '.join(to)}")
     except Exception as e:
         print(f"Email send failed (continuing): {e}")
+
+
+def build_alert_html(lead, rlist, fleet_rows, cur, obs, src, agreement,
+                     alerts, has_image):
+    """HTML body for an alert email."""
+    esc = lambda s: (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;"))
+    parts = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;'
+             'color:#222;line-height:1.5;max-width:620px">']
+    parts.append(f'<p style="margin:0 0 10px"><b>{esc(lead)}</b></p>')
+    if rlist:
+        parts.append('<ul style="margin:0 0 12px;padding-left:20px">' +
+                     "".join(f"<li>{esc(r)}</li>" for r in rlist) + "</ul>")
+    if has_image:
+        parts.append('<img src="cid:conditions" width="720" '
+                     'alt="Wind compass and fleet status" '
+                     'style="width:100%;max-width:720px;height:auto;'
+                     'border:1px solid #ddd;border-radius:6px;margin:6px 0 2px">')
+    if fleet_rows:
+        parts.append(fleet_table_html(fleet_rows))
+    parts.append('<p style="margin:14px 0 4px;font-size:13px;color:#555">'
+                 f'<b>Forecast:</b> {esc(conditions_line(cur))}<br>'
+                 f'{esc(obs_line(obs))}<br>'
+                 f'Primary model: {esc(src)}<br>'
+                 f'{esc(agreement_line(agreement))}')
+    if alerts:
+        parts.append(f'<br>NWS alerts: {esc(", ".join(sorted(set(alerts))))}')
+    parts.append('</p>')
+    parts.append('<p style="margin:12px 0 0;font-size:12px;color:#777;'
+                 'border-top:1px solid #eee;padding-top:8px">'
+                 'Forecast and observation based. Confirm lightning by eye and ear '
+                 'and apply the 30-30 rule. This assists the call; it does not make it.</p>')
+    parts.append('</div>')
+    return "".join(parts)
 
 
 def conditions_line(cur):
@@ -486,6 +589,35 @@ def main():
     new_state = {}
     ts = now.strftime("%-I:%M %p")
 
+    # ---- conditions graphic + per-asset fleet status -----------------------
+    # Prefer MEASURED wind for the graphic; fall back to the forecast if no
+    # station is reporting, so the picture always reflects the best data we have.
+    if obs:
+        g_wind, g_gust, g_dir = obs["wind"], obs["gust"], obs["dir"]
+        g_station = obs["station"]
+    else:
+        g_wind, g_gust, g_dir = cur["wind"], cur["gust"], cur["dir"]
+        g_station = f"{src} forecast (no station reporting)"
+    # Lightning or a hard NWS warning halts the entire fleet regardless of wind.
+    force_stop = None
+    if cur["storm"]:
+        force_stop = "thunderstorm overhead"
+    elif alert_stop:
+        force_stop = "NWS marine/storm warning"
+
+    fleet_rows, graphic = None, None
+    if fleet_status:
+        try:
+            fleet_rows = fleet_status(g_wind, g_gust, g_dir, force_stop)
+        except Exception as e:
+            print(f"fleet status failed (continuing): {e}")
+    if render_conditions_png:
+        try:
+            graphic = render_conditions_png(g_wind, g_gust, g_dir, g_station,
+                                            force_stop_reason=force_stop)
+        except Exception as e:
+            print(f"graphic render failed (continuing): {e}")
+
     def is_alert(lvl):
         return lvl == "STOP" or (ALERT_ON_CAUTION and lvl == "CAUTION")
 
@@ -511,22 +643,39 @@ def main():
             why = "; ".join(rlist[:3])
             conf = agreement["level"]
             send_sms(f"{tag} — {name}. {why}. ({ts}) {conditions_line(cur)} [{conf} conf]")
-            send_email(
-                f"{tag} — {name}",
+            text_body = (
                 f"{lead}\n\nReasons:\n" + "\n".join(f"  • {r}" for r in rlist) +
+                (("\n\nFleet:\n" + fleet_table_text(fleet_rows)) if fleet_rows else "") +
                 f"\n\nForecast: {conditions_line(cur)}\n"
                 f"{obs_line(obs)}\n"
                 f"Primary model: {src}\n"
                 f"{agreement_line(agreement)}\n"
-                + (f"NWS alerts: {', '.join(set(alerts))}\n" if alerts else "")
+                + (f"NWS alerts: {', '.join(sorted(set(alerts)))}\n" if alerts else "")
                 + "\nThis is forecast/observation-based. Confirm lightning by eye/ear (30-30 rule)."
+            )
+            send_email(
+                f"{tag} — {name}",
+                text_body,
+                html_body=build_alert_html(lead, rlist, fleet_rows, cur, obs,
+                                           src, agreement, alerts,
+                                           has_image=graphic is not None),
+                image_png=graphic,
             )
             print(f"ALERT: {name} {was} -> {level}")
         # transition back to fully clear
         elif not is_alert(level) and is_alert(was):
             send_sms(f"✅ WFC CLEAR — {name} OK. ({ts}) {conditions_line(cur)}")
-            send_email(f"✅ WFC CLEAR — {name}",
-                       f"{name} cleared to operate as of {ts}.\n\nConditions: {conditions_line(cur)}")
+            clear_lead = f"{name} cleared to operate as of {ts}."
+            send_email(
+                f"✅ WFC CLEAR — {name}",
+                clear_lead +
+                (("\n\nFleet:\n" + fleet_table_text(fleet_rows)) if fleet_rows else "") +
+                f"\n\nConditions: {conditions_line(cur)}\n{obs_line(obs)}",
+                html_body=build_alert_html(clear_lead, [], fleet_rows, cur, obs,
+                                           src, agreement, alerts,
+                                           has_image=graphic is not None),
+                image_png=graphic,
+            )
             print(f"ALL CLEAR: {name} {was} -> {level}")
         else:
             print(f"{name}: {was} -> {level} (no change in alert state)")
