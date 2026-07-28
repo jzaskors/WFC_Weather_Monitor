@@ -7,6 +7,9 @@ sailing programs should HALT, and an all-clear when they reopen.
 Mirrors the decision logic in the dashboard. Edit THRESHOLDS to keep them in sync.
 Designed to run every ~10 min on a scheduler (e.g. GitHub Actions cron).
 State is persisted in state.json so you only get alerted on a *change*, not every run.
+
+Observed-data priority: Sagamore YC station (in-harbor, no offset) ->
+NDBC 44040 -> KPTN6 (both exposure-offset). Requires sagamore.py alongside.
 """
 
 import json
@@ -18,6 +21,14 @@ from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
 import requests
+
+# Sagamore YC WeatherLink fetcher (sagamore.py in the same folder).
+# If the file is missing, the monitor still runs on buoys alone.
+try:
+    from sagamore import fetch_sagamore
+except Exception as _e:
+    print(f"sagamore module unavailable ({_e}); using buoys only")
+    fetch_sagamore = None
 
 # ----------------------------------------------------------------------------
 # SITE + THRESHOLDS  (keep in sync with the dashboard)
@@ -149,17 +160,51 @@ def agreement_line(ag):
 
 
 # ----------------------------------------------------------------------------
-# Real-time observations (NDBC). These are MEASURED conditions, not forecasts.
-# 44040 (WLIS buoy, ~5 nm N in the Sound) is closest but intermittent;
-# KPTN6 (Kings Point NOAA station, ~11 mi WSW) is the reliable fallback.
+# Real-time observations. These are MEASURED conditions, not forecasts.
+# Priority:
+#   1. Sagamore YC station — IN the harbor next door. Most representative;
+#      judged against thresholds as-is (offset 0).
+#   2. 44040 (WLIS buoy, ~5 nm N in the Sound) — closest buoy but intermittent.
+#   3. KPTN6 (Kings Point NOAA station, ~11 mi WSW) — the reliable fallback.
+# Buoy/coastal stations sit in more exposed water than the sheltered harbor,
+# so their readings are judged against thresholds raised by the offset below.
 # ----------------------------------------------------------------------------
 OBS_STATIONS = [("44040", "WLIS buoy (5 nm N)"), ("KPTN6", "Kings Point (11 mi WSW)")]
 OBS_MAX_AGE_MIN = 90          # ignore observations older than this
 MS_TO_KN = 1.94384
+OBS_EXPOSURE_OFFSET_KN = 2    # applied to buoy/coastal stations only, never Sagamore
 
 
-def fetch_observations():
-    """Return newest usable observation: {wind, gust, dir, station, age_min} in kn, or None."""
+def _fetch_sagamore_obs():
+    """Sagamore YC station via WeatherLink; normalized to the common obs shape.
+    Returns None if the module is absent, the station is offline, or data is
+    stale — the caller then falls through to the buoys."""
+    if fetch_sagamore is None:
+        return None
+    try:
+        s = fetch_sagamore()
+    except Exception as e:
+        print(f"sagamore fetch failed: {e}")
+        return None
+    if not s or s.get("wind_kn") is None:
+        return None
+    if s.get("observed_epoch"):
+        from datetime import timezone
+        age_min = (datetime.now(timezone.utc).timestamp() - s["observed_epoch"]) / 60
+    else:
+        age_min = 0   # feed omits timestamp; sagamore.py already rejects stale data
+    return {
+        "wind": s["wind_kn"],
+        "gust": s.get("gust_kn"),
+        "dir": s.get("wind_dir_deg"),
+        "station": "Sagamore YC (in harbor)",
+        "age_min": round(age_min),
+        "offset": 0,   # in-harbor station: thresholds apply as-is
+    }
+
+
+def _fetch_ndbc_obs():
+    """Newest usable NDBC observation in kn, or None."""
     from datetime import timezone
     for sid, label in OBS_STATIONS:
         try:
@@ -190,10 +235,20 @@ def fetch_observations():
                 "dir": wdir,
                 "station": label,
                 "age_min": round(age_min),
+                "offset": OBS_EXPOSURE_OFFSET_KN,
             }
         except Exception as e:
             print(f"obs {sid} fetch failed: {e}")
     return None
+
+
+def fetch_observations():
+    """Best available measured conditions: Sagamore first, then buoys."""
+    obs = _fetch_sagamore_obs()
+    if obs:
+        return obs
+    print("Sagamore unavailable — falling back to NDBC stations")
+    return _fetch_ndbc_obs()
 
 
 def obs_line(obs):
@@ -203,10 +258,6 @@ def obs_line(obs):
     return (f"Observed at {obs['station']}: {round(obs['wind'])} kn"
             f"{g} {compass(obs['dir'])} ({obs['age_min']} min ago)")
 
-
-# Observation stations sit in more exposed water than the sheltered harbor, so
-# observed winds are judged against thresholds raised by this many knots.
-OBS_EXPOSURE_OFFSET_KN = 2
 
 _WIND_KEYS = ("windCaution", "windStop", "gustCaution", "gustStop",
               "offWindCaution", "offWindStop")
@@ -222,17 +273,22 @@ def _offset_thresholds(offset):
 
 
 def evaluate_observed(activity, obs):
-    """Run MEASURED wind through thresholds raised by the exposure offset;
-    reasons tagged with station. Reported values stay the true measured ones."""
+    """Run MEASURED wind through the thresholds. Sagamore (offset 0) is judged
+    against limits as-is; buoy stations against limits raised by their exposure
+    offset. Reported values stay the true measured ones."""
     if not obs:
         return "GO", []
+    offset = obs.get("offset", 0)
     cur = {"storm": False, "precip": None, "visMi": None, "cape": None,
            "wind": obs["wind"], "dir": obs["dir"], "gust": obs["gust"]}
     level, reasons = evaluate(activity, cur, False,
-                              thresholds=_offset_thresholds(OBS_EXPOSURE_OFFSET_KN))
-    tagged = [(l, f"{r} — MEASURED at {obs['station']} "
-                  f"(judged vs +{OBS_EXPOSURE_OFFSET_KN} kn exposure-adjusted limits)")
-              for l, r in reasons]
+                              thresholds=_offset_thresholds(offset))
+    if offset:
+        tag = (f" — MEASURED at {obs['station']} "
+               f"(judged vs +{offset} kn exposure-adjusted limits)")
+    else:
+        tag = f" — MEASURED at {obs['station']}"
+    tagged = [(l, f"{r}{tag}") for l, r in reasons]
     return level, tagged
 
 
