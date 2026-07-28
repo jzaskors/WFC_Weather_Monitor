@@ -1,29 +1,23 @@
 name: WFC Weather Monitor
-
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
-
 permissions:
   contents: write
-
 concurrency:
   group: weather-monitor
   cancel-in-progress: false
-
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
-      - run: pip install -r requirements.txt
-
+      # pillow renders the compass / fleet graphic embedded in alert emails
+      - run: pip install -r requirements.txt pillow
       - name: Check conditions and alert
         env:
           TWILIO_SID:   ${{ secrets.TWILIO_SID }}
@@ -37,7 +31,6 @@ jobs:
           EMAIL_FROM:   ${{ secrets.EMAIL_FROM }}
           EMAIL_TO:     ${{ secrets.EMAIL_TO }}
         run: python monitor.py
-
       - name: Persist state
         run: |
           if [[ -n "$(git status --porcelain state.json)" ]]; then
