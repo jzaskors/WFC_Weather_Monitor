@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""
+weather_diag.py — WFC weather system diagnostic email.
+
+Renders the current conditions graphic AND a full provenance panel showing every
+configured source: which ones answered, how old their data is, how long they took,
+and which one is actually driving the fleet call.
+
+This is a TEST tool. It sends to WFC_DIAG_TO only, prefixes the subject with
+[DIAGNOSTIC], and stamps a banner on the email so it can never be mistaken for an
+operational alert. It does not touch the ops distribution list.
+
+    python3 weather_diag.py                # probe + write HTML preview, no send
+    python3 weather_diag.py --send         # probe + email it
+    python3 weather_diag.py --out /tmp/x.html
+
+Env:
+    BREVO_SMTP_USER, BREVO_SMTP_KEY, WFC_DIAG_FROM, WFC_DIAG_TO
+    WEATHERLINK_API_KEY, WEATHERLINK_API_SECRET, SYC_WL_STATION_ID, SYC_EMBED_UUID
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import math
+import os
+import smtplib
+import sys
+import time
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from typing import Any, Callable
+
+import requests
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+WFC_LAT, WFC_LON = 40.8846, -73.5307        # West Harbor, Oyster Bay
+TIMEOUT = 12
+
+# !!! PLACEHOLDER THRESHOLDS — replace with the real numbers from your monitor
+# before you trust anything this prints. Gust knots.
+FLEET_LIMITS = {
+    "Kayaks":       {"caution": 12, "stop": 18},
+    "Paddleboards": {"caution": 12, "stop": 16},
+    "Sonars":       {"caution": 20, "stop": 28},
+}
+
+# Offshore (wind blowing away from the beach) sector for West Harbor, degrees FROM.
+OFFSHORE_FROM, OFFSHORE_TO = 150, 240
+
+BREVO_HOST, BREVO_PORT = "smtp-relay.brevo.com", 587
+
+
+# ---------------------------------------------------------------------------
+# PROBE MODEL
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Probe:
+    name: str
+    tier: str                     # "PRIMARY" | "BACKUP" | "FORECAST"
+    distance_mi: float | None = None
+    status: str = "PENDING"       # OK | STALE | ERROR | NOT CONFIGURED
+    wind_kn: float | None = None
+    gust_kn: float | None = None
+    wind_dir_deg: int | None = None
+    age_min: float | None = None
+    latency_ms: int | None = None
+    detail: str = ""
+    endpoint: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return self.status == "OK" and self.gust_kn is not None
+
+    def reading(self) -> str:
+        if self.wind_kn is None:
+            return "\u2014"
+        s = f"{self.wind_kn:.0f} kn"
+        if self.gust_kn is not None:
+            s += f" g{self.gust_kn:.0f}"
+        if self.wind_dir_deg is not None:
+            s += f" @ {self.wind_dir_deg:03d}\u00b0"
+        return s
+
+
+def timed(fn: Callable[[], Any]) -> tuple[Any, int]:
+    t0 = time.monotonic()
+    out = fn()
+    return out, int((time.monotonic() - t0) * 1000)
+
+
+# ---------------------------------------------------------------------------
+# SOURCES
+# ---------------------------------------------------------------------------
+
+def probe_sagamore() -> Probe:
+    p = Probe("Sagamore YC (WeatherLink)", "PRIMARY", 0.2)
+    p.endpoint = "weatherlink.com \u2014 v2 API, embed fallback"
+    try:
+        import sagamore
+    except ImportError:
+        p.status = "ERROR"
+        p.detail = "sagamore.py not importable from this directory"
+        return p
+    try:
+        obs, ms = timed(sagamore.fetch_sagamore)
+        p.latency_ms = ms
+        p.status = "OK"
+        p.wind_kn, p.gust_kn = obs.wind_kn, obs.gust_kn
+        p.wind_dir_deg, p.age_min = obs.wind_dir_deg, obs.age_min
+        p.detail = f"backend={obs.backend}"
+    except Exception as e:
+        p.status = "ERROR"
+        p.detail = str(e)[:400]
+    return p
+
+
+def probe_ndbc(station: str, label: str, dist: float) -> Probe:
+    p = Probe(f"NDBC {station} ({label})", "BACKUP", dist)
+    url = f"https://www.ndbc.noaa.gov/data/realtime2/{station}.txt"
+    p.endpoint = url
+    try:
+        r, ms = timed(lambda: requests.get(url, timeout=TIMEOUT))
+        p.latency_ms = ms
+        r.raise_for_status()
+        lines = [l for l in r.text.splitlines() if l and not l.startswith("#")]
+        if not lines:
+            p.status, p.detail = "ERROR", "no data rows"
+            return p
+        f = lines[0].split()
+        obs_t = datetime(int(f[0]), int(f[1]), int(f[2]), int(f[3]), int(f[4]), tzinfo=timezone.utc)
+        p.age_min = (datetime.now(timezone.utc) - obs_t).total_seconds() / 60
+
+        def num(v):
+            return None if v in ("MM", "999", "99.0") else float(v)
+
+        wdir, wspd, gst = num(f[5]), num(f[6]), num(f[7])
+        p.wind_dir_deg = int(wdir) if wdir is not None else None
+        p.wind_kn = wspd * 1.94384 if wspd is not None else None   # m/s -> kn
+        p.gust_kn = gst * 1.94384 if gst is not None else None
+        p.status = "OK" if p.age_min <= 90 else "STALE"
+        if p.status == "STALE":
+            p.detail = f"{p.age_min:.0f} min old"
+    except Exception as e:
+        p.status, p.detail = "ERROR", str(e)[:400]
+    return p
+
+
+def probe_nws(station: str, label: str, dist: float) -> Probe:
+    p = Probe(f"NWS {station} ({label})", "BACKUP", dist)
+    url = f"https://api.weather.gov/stations/{station}/observations/latest"
+    p.endpoint = url
+    try:
+        r, ms = timed(lambda: requests.get(
+            url, timeout=TIMEOUT,
+            headers={"User-Agent": "WFC-weather-monitor (waterfront safety)"}))
+        p.latency_ms = ms
+        r.raise_for_status()
+        props = r.json()["properties"]
+        obs_t = datetime.fromisoformat(props["timestamp"].replace("Z", "+00:00"))
+        p.age_min = (datetime.now(timezone.utc) - obs_t).total_seconds() / 60
+
+        def val(k):
+            v = (props.get(k) or {}).get("value")
+            return float(v) if v is not None else None
+
+        ws, wg, wd = val("windSpeed"), val("windGust"), val("windDirection")
+        p.wind_kn = ws * 0.539957 if ws is not None else None      # km/h -> kn
+        p.gust_kn = wg * 0.539957 if wg is not None else None
+        p.wind_dir_deg = int(wd) if wd is not None else None
+        p.status = "OK" if p.age_min <= 90 else "STALE"
+        if p.status == "STALE":
+            p.detail = f"{p.age_min:.0f} min old"
+    except Exception as e:
+        p.status, p.detail = "ERROR", str(e)[:400]
+    return p
+
+
+def probe_open_meteo() -> Probe:
+    p = Probe("Open-Meteo (forecast)", "FORECAST", 0.0)
+    url = "https://api.open-meteo.com/v1/forecast"
+    p.endpoint = url
+    try:
+        r, ms = timed(lambda: requests.get(url, timeout=TIMEOUT, params={
+            "latitude": WFC_LAT, "longitude": WFC_LON,
+            "current": "wind_speed_10m,wind_gusts_10m,wind_direction_10m",
+            "wind_speed_unit": "kn", "models": "best_match",
+        }))
+        p.latency_ms = ms
+        r.raise_for_status()
+        c = r.json()["current"]
+        p.wind_kn = c.get("wind_speed_10m")
+        p.gust_kn = c.get("wind_gusts_10m")
+        wd = c.get("wind_direction_10m")
+        p.wind_dir_deg = int(wd) if wd is not None else None
+        p.age_min = 0.0
+        p.status = "OK"
+        p.detail = "model output, not an observation"
+    except Exception as e:
+        p.status, p.detail = "ERROR", str(e)[:400]
+    return p
+
+
+def run_probes() -> list[Probe]:
+    return [
+        probe_sagamore(),
+        probe_nws("KLGA", "LaGuardia", 18.0),
+        probe_ndbc("44040", "Western LI Sound", 12.0),
+        probe_open_meteo(),
+    ]
+
+
+def select_active(probes: list[Probe]) -> tuple[Probe | None, list[str]]:
+    """Tier order: PRIMARY, then BACKUP, then FORECAST. Returns winner + notes."""
+    notes = []
+    for tier in ("PRIMARY", "BACKUP", "FORECAST"):
+        for p in probes:
+            if p.tier == tier and p.usable:
+                if tier != "PRIMARY":
+                    notes.append(
+                        f"PRIMARY (Sagamore) unavailable \u2014 fell through to {tier}: {p.name}")
+                return p, notes
+        for p in probes:
+            if p.tier == tier and not p.usable:
+                notes.append(f"{tier} {p.name}: {p.status} \u2014 {p.detail or 'no detail'}")
+    return None, notes
+
+
+# ---------------------------------------------------------------------------
+# GRAPHIC
+# ---------------------------------------------------------------------------
+
+BG, FG, MUTED, ACCENT = (13, 27, 48), (255, 255, 255), (140, 158, 184), (240, 176, 66)
+GREEN, AMBER, RED = (74, 201, 126), (240, 176, 66), (232, 93, 93)
+
+
+def fleet_status(gust: float | None) -> list[tuple[str, str, tuple]]:
+    out = []
+    for craft, lim in FLEET_LIMITS.items():
+        if gust is None:
+            out.append((craft, "NO DATA", MUTED))
+        elif gust >= lim["stop"]:
+            out.append((craft, "NO GO", RED))
+        elif gust >= lim["caution"]:
+            out.append((craft, "CAUTION", AMBER))
+        else:
+            out.append((craft, "GO", GREEN))
+    return out
+
+
+def render_graphic(active: Probe | None) -> bytes:
+    """Compass + fleet card as PNG. PIL only — no cairo/system deps."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    W, H, S = 1000, 460, 2                     # S = supersample for crisp text
+    img = Image.new("RGB", (W * S, H * S), BG)
+    d = ImageDraw.Draw(img)
+
+    def font(sz, bold=False):
+        paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans%s.ttf" % ("-Bold" if bold else ""),
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                return ImageFont.truetype(p, sz * S)
+        return ImageFont.load_default()
+
+    d.text((28 * S, 20 * S), "WEST HARBOR CONDITIONS", font=font(21, True), fill=FG)
+    src = active.name if active else "NO SOURCE AVAILABLE"
+    d.text((28 * S, 50 * S), f"Source: {src}", font=font(13), fill=MUTED)
+
+    # --- compass -----------------------------------------------------------
+    cx, cy, R = 190 * S, 250 * S, 118 * S
+    # offshore wedge (PIL angles: 0 = 3 o'clock, clockwise)
+    d.pieslice([cx - R, cy - R, cx + R, cy + R],
+               start=OFFSHORE_FROM - 90, end=OFFSHORE_TO - 90, fill=(60, 45, 18))
+    for rad, col in ((R, (44, 62, 88)), (int(R * 0.62), (34, 50, 74))):
+        d.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline=col, width=2 * S)
+
+    for lbl, ang in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
+        a = math.radians(ang - 90)
+        tx, ty = cx + (R + 22 * S) * math.cos(a), cy + (R + 22 * S) * math.sin(a)
+        d.text((tx, ty), lbl, font=font(15, True), fill=FG, anchor="mm")
+
+    if active and active.wind_dir_deg is not None:
+        a = math.radians(active.wind_dir_deg - 90)   # direction wind comes FROM
+        x0, y0 = cx + R * math.cos(a), cy + R * math.sin(a)
+        x1, y1 = cx + R * 0.30 * math.cos(a), cy + R * 0.30 * math.sin(a)
+        d.line([x0, y0, x1, y1], fill=FG, width=5 * S)
+        hl = 13 * S
+        for off in (140, -140):
+            b = a + math.radians(off)
+            d.line([x1, y1, x1 + hl * math.cos(b), y1 + hl * math.sin(b)], fill=FG, width=5 * S)
+
+    spd = f"{active.wind_kn:.0f}" if active and active.wind_kn is not None else "--"
+    d.text((cx, cy - 16 * S), spd, font=font(46, True), fill=FG, anchor="mm")
+    d.text((cx, cy + 16 * S), "kn sustained", font=font(12), fill=MUTED, anchor="mm")
+    if active and active.gust_kn is not None:
+        d.text((cx, cy + 38 * S), f"gusts {active.gust_kn:.0f}",
+               font=font(14, True), fill=ACCENT, anchor="mm")
+    d.text((cx, cy + R + 46 * S), "OFFSHORE SECTOR", font=font(11, True),
+           fill=ACCENT, anchor="mm")
+
+    # --- fleet card --------------------------------------------------------
+    px, py, pw, ph = 400 * S, 100 * S, 570 * S, 250 * S
+    d.rounded_rectangle([px, py, px + pw, py + ph], radius=10 * S,
+                        fill=(20, 38, 62), outline=(44, 62, 88), width=2 * S)
+    d.text((px + 26 * S, py + 20 * S), "FLEET", font=font(13, True), fill=MUTED)
+    d.text((px + pw - 26 * S, py + 20 * S), "STATUS", font=font(13, True),
+           fill=MUTED, anchor="ra")
+
+    gust = active.gust_kn if active else None
+    for i, (craft, state, col) in enumerate(fleet_status(gust)):
+        ry = py + 62 * S + i * 60 * S
+        d.rectangle([px + 26 * S, ry, px + 30 * S, ry + 30 * S], fill=col)
+        d.text((px + 46 * S, ry + 15 * S), craft, font=font(19), fill=FG, anchor="lm")
+        d.text((px + pw - 26 * S, ry + 15 * S), state, font=font(18, True),
+               fill=col, anchor="rm")
+
+    d.text((28 * S, H * S - 34 * S),
+           "Confirm lightning by eye and ear \u2014 30-30 rule. "
+           "This graphic assists the call; it does not make it.",
+           font=font(12), fill=MUTED)
+
+    img = img.resize((W, H), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
+
+STATUS_COLOR = {"OK": "#2e7d32", "STALE": "#ef6c00", "ERROR": "#c62828",
+                "NOT CONFIGURED": "#757575"}
+
+
+def render_html(probes: list[Probe], active: Probe | None, notes: list[str]) -> str:
+    now = datetime.now().strftime("%a %b %d, %Y at %-I:%M %p")
+
+    rows = []
+    for p in probes:
+        win = p is active
+        rows.append(f"""
+        <tr style="background:{'#e8f5e9' if win else '#fff'}">
+          <td style="padding:9px 10px;border-bottom:1px solid #e0e0e0;font-size:13px">
+            {'&#9654; ' if win else ''}<strong>{p.name}</strong>
+            <div style="color:#757575;font-size:11px">{p.tier}
+            {f'&middot; {p.distance_mi:.1f} mi' if p.distance_mi is not None else ''}</div>
+          </td>
+          <td style="padding:9px 10px;border-bottom:1px solid #e0e0e0;font-size:13px;
+              font-weight:700;color:{STATUS_COLOR.get(p.status,'#000')}">{p.status}</td>
+          <td style="padding:9px 10px;border-bottom:1px solid #e0e0e0;font-size:13px;
+              font-family:monospace">{p.reading()}</td>
+          <td style="padding:9px 10px;border-bottom:1px solid #e0e0e0;font-size:13px">
+            {f'{p.age_min:.0f} min' if p.age_min is not None else '&mdash;'}</td>
+          <td style="padding:9px 10px;border-bottom:1px solid #e0e0e0;font-size:13px">
+            {f'{p.latency_ms} ms' if p.latency_ms is not None else '&mdash;'}</td>
+          <td style="padding:9px 10px;border-bottom:1px solid #e0e0e0;font-size:11px;
+              color:#616161;max-width:280px;word-break:break-word">{p.detail or '&mdash;'}</td>
+        </tr>""")
+
+    if active is None:
+        banner = ('<div style="background:#c62828;color:#fff;padding:14px;border-radius:6px;'
+                  'font-weight:700">NO USABLE SOURCE &mdash; the monitor cannot make a call.</div>')
+    elif active.tier == "PRIMARY":
+        banner = (f'<div style="background:#2e7d32;color:#fff;padding:14px;border-radius:6px">'
+                  f'<strong>Driving the call: {active.name}</strong><br>'
+                  f'<span style="font-size:13px">Primary source healthy.</span></div>')
+    else:
+        banner = (f'<div style="background:#ef6c00;color:#fff;padding:14px;border-radius:6px">'
+                  f'<strong>FALLBACK IN USE: {active.name}</strong><br>'
+                  f'<span style="font-size:13px">Sagamore is not answering. This reading is '
+                  f'{active.distance_mi:.0f} mi away and may not reflect West Harbor.</span></div>')
+
+    notes_html = "".join(
+        f'<li style="margin-bottom:5px">{n}</li>' for n in notes) or "<li>None</li>"
+
+    env_rows = "".join(
+        f'<tr><td style="padding:4px 10px;font-family:monospace;font-size:12px">{k}</td>'
+        f'<td style="padding:4px 10px;font-size:12px;color:'
+        f'{"#2e7d32" if os.environ.get(k) else "#c62828"}">'
+        f'{"set" if os.environ.get(k) else "NOT SET"}</td></tr>'
+        for k in ("WEATHERLINK_API_KEY", "WEATHERLINK_API_SECRET", "SYC_WL_STATION_ID",
+                  "SYC_EMBED_UUID", "BREVO_SMTP_USER", "BREVO_SMTP_KEY"))
+
+    limits = "".join(
+        f'<tr><td style="padding:4px 10px;font-size:12px">{c}</td>'
+        f'<td style="padding:4px 10px;font-size:12px">caution &ge; {v["caution"]} kn</td>'
+        f'<td style="padding:4px 10px;font-size:12px">no-go &ge; {v["stop"]} kn</td></tr>'
+        for c, v in FLEET_LIMITS.items())
+
+    return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f5f5f5">
+<div style="max-width:760px;margin:0 auto;padding:18px;
+     font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+
+  <div style="background:#4527a0;color:#fff;padding:16px;border-radius:6px;margin-bottom:16px">
+    <div style="font-size:19px;font-weight:800;letter-spacing:.5px">DIAGNOSTIC &mdash; NOT AN ALERT</div>
+    <div style="font-size:13px;margin-top:5px;opacity:.9">
+      Source provenance test for the WFC weather monitor. Do not act on this email.
+      Generated {now}.</div>
+  </div>
+
+  {banner}
+
+  <h2 style="font-size:15px;margin:24px 0 8px;color:#333">Current graphic</h2>
+  <img src="cid:conditions" width="100%" style="max-width:720px;border-radius:8px;display:block">
+
+  <h2 style="font-size:15px;margin:24px 0 8px;color:#333">Every source probed</h2>
+  <table style="width:100%;border-collapse:collapse;background:#fff;border-radius:6px;
+         overflow:hidden;border:1px solid #e0e0e0">
+    <tr style="background:#eceff1">
+      <th style="padding:9px 10px;text-align:left;font-size:11px;color:#546e7a">SOURCE</th>
+      <th style="padding:9px 10px;text-align:left;font-size:11px;color:#546e7a">STATUS</th>
+      <th style="padding:9px 10px;text-align:left;font-size:11px;color:#546e7a">READING</th>
+      <th style="padding:9px 10px;text-align:left;font-size:11px;color:#546e7a">AGE</th>
+      <th style="padding:9px 10px;text-align:left;font-size:11px;color:#546e7a">LATENCY</th>
+      <th style="padding:9px 10px;text-align:left;font-size:11px;color:#546e7a">DETAIL</th>
+    </tr>
+    {''.join(rows)}
+  </table>
+
+  <h2 style="font-size:15px;margin:24px 0 8px;color:#333">Tier resolution log</h2>
+  <ul style="font-size:12.5px;color:#424242;background:#fff;padding:14px 14px 14px 30px;
+      border-radius:6px;border:1px solid #e0e0e0;margin:0">{notes_html}</ul>
+
+  <h2 style="font-size:15px;margin:24px 0 8px;color:#333">Thresholds in use</h2>
+  <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e0e0e0;
+         border-radius:6px">{limits}</table>
+  <p style="font-size:11.5px;color:#c62828;margin:7px 0 0">
+    These are placeholder limits from the script, not your production values.
+    Reconcile them with the monitor before reading anything into the fleet column.</p>
+
+  <h2 style="font-size:15px;margin:24px 0 8px;color:#333">Credentials visible to this run</h2>
+  <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e0e0e0;
+         border-radius:6px">{env_rows}</table>
+  <p style="font-size:11.5px;color:#757575;margin:7px 0 0">
+    Presence only &mdash; no values are read or transmitted.</p>
+
+  <p style="font-size:11.5px;color:#9e9e9e;margin-top:26px;border-top:1px solid #e0e0e0;
+     padding-top:12px">
+    Diagnostic output. Confirm lightning by eye and ear and apply the 30-30 rule.
+    This assists the call; it does not make it.</p>
+</div></body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# SEND
+# ---------------------------------------------------------------------------
+
+def send_email(html: str, png: bytes, active: Probe | None) -> None:
+    user, key = os.environ.get("BREVO_SMTP_USER"), os.environ.get("BREVO_SMTP_KEY")
+    to, frm = os.environ.get("WFC_DIAG_TO"), os.environ.get("WFC_DIAG_FROM")
+    missing = [n for n, v in (("BREVO_SMTP_USER", user), ("BREVO_SMTP_KEY", key),
+                              ("WFC_DIAG_TO", to), ("WFC_DIAG_FROM", frm)) if not v]
+    if missing:
+        raise SystemExit("Cannot send, missing env: " + ", ".join(missing))
+
+    tag = active.tier if active else "NO SOURCE"
+    msg = EmailMessage()
+    msg["Subject"] = f"[DIAGNOSTIC] WFC weather sources \u2014 {tag}"
+    msg["From"], msg["To"] = frm, to
+    msg["X-WFC-Diagnostic"] = "true"
+    msg.set_content(
+        "Diagnostic output from the WFC weather monitor. Not an operational alert. "
+        "View in an HTML-capable client.")
+    msg.add_alternative(html, subtype="html")
+    msg.get_payload()[1].add_related(
+        png, "image", "png", cid="<conditions>", filename="conditions.png")
+
+    with smtplib.SMTP(BREVO_HOST, BREVO_PORT, timeout=30) as s:
+        s.starttls()
+        s.login(user, key)
+        s.send_message(msg)
+    print(f"Sent to {to}")
+
+
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--send", action="store_true", help="email it (default: preview only)")
+    ap.add_argument("--out", default="diag_preview.html")
+    args = ap.parse_args()
+
+    print("Probing sources...\n")
+    probes = run_probes()
+    active, notes = select_active(probes)
+
+    w = max(len(p.name) for p in probes)
+    for p in probes:
+        mark = "->" if p is active else "  "
+        print(f"{mark} {p.name:<{w}}  {p.status:<15} {p.reading():<22} {p.detail[:60]}")
+    print()
+
+    png = render_graphic(active)
+    html = render_html(probes, active, notes)
+
+    with open(args.out, "w") as f:
+        f.write(html.replace('src="cid:conditions"',
+                             'src="data:image/png;base64,' +
+                             base64.b64encode(png).decode() + '"'))
+    print(f"Preview written to {args.out}")
+
+    if args.send:
+        send_email(html, png, active)
+    else:
+        print("Not sent. Re-run with --send to email it.")
+
+    return 0 if active and active.tier == "PRIMARY" else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        traceback.print_exc()
+        sys.exit(2)
