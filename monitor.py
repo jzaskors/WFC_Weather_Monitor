@@ -29,7 +29,9 @@ import requests
 try:
     from sagamore import fetch_sagamore
 except Exception as _e:
-    print(f"sagamore module unavailable ({_e}); using buoys only")
+    print(f"!!! sagamore module unavailable ({_e}); using buoys only. "
+          f"Check that the file is named lowercase 'sagamore.py' — the runner "
+          f"is case-sensitive.")
     fetch_sagamore = None
 
 # Conditions graphic for alert emails (render_conditions.py, needs Pillow).
@@ -197,7 +199,8 @@ def _fetch_sagamore_obs():
     except Exception as e:
         print(f"sagamore fetch failed: {e}")
         return None
-    if not s or s.get("wind_kn") is None:
+    if not isinstance(s, dict) or s.get("wind_kn") is None:
+        print(f"sagamore returned unusable data: {s!r}")
         return None
     if s.get("observed_epoch"):
         from datetime import timezone
@@ -211,6 +214,10 @@ def _fetch_sagamore_obs():
         "station": "Sagamore YC (in harbor)",
         "age_min": round(age_min),
         "offset": 0,   # in-harbor station: thresholds apply as-is
+        # The WeatherLink feed has no live gust (only the daily peak), so gust
+        # is None here. Flag it so the email says so instead of going blank.
+        "gust_monitored": s.get("gust_monitored", s.get("gust_kn") is not None),
+        "peak_gust": s.get("peak_gust_kn"),
     }
 
 
@@ -265,7 +272,14 @@ def fetch_observations():
 def obs_line(obs):
     if not obs:
         return "Observed: unavailable (no reporting station)"
-    g = f" g{round(obs['gust'])}" if obs["gust"] is not None else ""
+    if obs["gust"] is not None:
+        g = f" g{round(obs['gust'])}"
+    elif obs.get("gust_monitored", True) is False:
+        pk = obs.get("peak_gust")
+        g = " (gust not reported by station"
+        g += f"; peak today {round(pk)} kn)" if pk is not None else ")"
+    else:
+        g = ""
     return (f"Observed at {obs['station']}: {round(obs['wind'])} kn"
             f"{g} {compass(obs['dir'])} ({obs['age_min']} min ago)")
 
