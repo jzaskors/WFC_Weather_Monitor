@@ -1,297 +1,206 @@
 """
 sagamore.py — Sagamore Yacht Club live observation source for the WFC weather monitor.
 
-Two backends, in priority order:
+PRIMARY live-observation source. The station is a Davis Vantage Vue at SYC,
+~250 m from the WFC dock, publishing through WeatherLink. No API key needed:
+the embeddable-page data endpoint is public.
 
-  1. WeatherLink v2 API  (documented, stable, signed — requires key+secret from SYC)
-  2. WeatherLink embed JSON  (undocumented, no auth, works today, can break without notice)
+    https://www.weatherlink.com/embeddablePage/getData/<EMBED_ID>
 
-Both return a normalized Observation. Failures raise SourceUnavailable with a reason
-string, so the caller's tier logic can LABEL the fallback rather than silently
-substituting Kings Point and presenting it as a local reading.
+FILENAME MATTERS: this file must be lowercase `sagamore.py`. monitor.py does
+`from sagamore import fetch_sagamore`, and GitHub's Linux runners are
+case-sensitive — `Sagamore.py` silently fails to import and the monitor falls
+back to Kings Point.
+
+Interface contract with monitor.py:
+    fetch_sagamore() -> dict with keys
+        wind_kn         float  sustained wind, knots
+        gust_kn         None   ALWAYS None — see THE GUST NOTE
+        wind_dir_deg    int    direction wind is FROM, degrees true
+        observed_epoch  float  UTC epoch seconds of the observation
+    plus display-only extras (gust_monitored, peak_gust_kn, air_temp_f, ...).
+    Raises SagamoreUnavailable on any failure so the reason shows in the
+    Actions log and monitor.py falls through to the buoy tier.
+
+Payload shape (verified against the real feed, July 2026). Flat JSON; every
+numeric except windDirection arrives as a STRING:
+    wind "2"  windDirection 46  windUnits "knots"  gust "15"  gustAt 1785300955568
+    lastReceived 1785354342000 (epoch ms)  temperature "78.4"  tempUnits "&deg;F"
+    humidity, barometer, barometerTrend, rain, hiTemp/hiTempDate, loTemp/loTempDate
+
+=============================================================================
+THE GUST NOTE — read before changing gust_kn
+=============================================================================
+`gust` / `gustAt` are the DAILY PEAK gust and when it happened, not a current
+reading (July test: gustAt was ~15 hours older than lastReceived). A daily
+maximum only climbs, so feeding it to the threshold engine produces a HALT
+that cannot clear until the station resets at midnight. There is no
+current-gust field in this feed, so gust_kn is None by design and
+gust_monitored is False. monitor.py surfaces that in the email so a blank
+gust never reads as "no gust hazard".
+=============================================================================
 """
 
 from __future__ import annotations
 
-import os
+import json
 import time
-import logging
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Optional
 
 import requests
 
-log = logging.getLogger(__name__)
+EMBED_ID = "e9aef99860fc4aecb73f08d0d9cb3e37"
+ENDPOINT = f"https://www.weatherlink.com/embeddablePage/getData/{EMBED_ID}"
 
-# --- Configuration -----------------------------------------------------------
+STATION_LABEL = "Sagamore YC (in harbor)"
 
-SYC_EMBED_UUID = os.environ.get(
-    "SYC_EMBED_UUID", "e9aef99860fc4aecb73f08d0d9cb3e37"
-)
-SYC_STATION_ID = os.environ.get("SYC_WL_STATION_ID")      # for v2 API
-WL_API_KEY = os.environ.get("WEATHERLINK_API_KEY")
-WL_API_SECRET = os.environ.get("WEATHERLINK_API_SECRET")
+# Demote to the buoy tier if the last report is older than this. The station
+# reports every few minutes, so 20 minutes of silence means something is wrong.
+MAX_AGE_SECONDS = 20 * 60
+# Reject timestamps this far in the future (clock skew would read as fresh).
+MAX_FUTURE_SECONDS = 300
+REQUEST_TIMEOUT_SECONDS = 15
 
-EMBED_URL = "https://www.weatherlink.com/embeddablePage/summaryData/{uuid}"
-V2_URL = "https://api.weatherlink.com/v2/current/{station_id}"
-
-# An observation older than this is not trustworthy for a live GO/CAUTION call.
-MAX_AGE_MIN = int(os.environ.get("SYC_MAX_AGE_MIN", "25"))
-TIMEOUT_S = 10
-
-
-class SourceUnavailable(Exception):
-    """Raised when Sagamore cannot supply a usable observation."""
+# Unit conversion by the station's declared display units. If SYC changes
+# their WeatherLink display preference, the feed changes with it — convert
+# rather than assume.
+_TO_KNOTS = {"knots": 1.0, "kt": 1.0, "kts": 1.0, "mph": 0.868976,
+             "m/s": 1.94384, "km/h": 0.539957, "kph": 0.539957}
 
 
-@dataclass
-class Observation:
-    source: str               # "Sagamore YC" — what gets printed in the email
-    backend: str              # "weatherlink-v2" | "weatherlink-embed"
-    wind_kn: float | None
-    gust_kn: float | None
-    wind_dir_deg: int | None
-    air_temp_f: float | None
-    observed_at: datetime
-    distance_mi: float = 0.2  # adjacent to WFC
-
-    @property
-    def age_min(self) -> float:
-        return (datetime.now(timezone.utc) - self.observed_at).total_seconds() / 60
-
-    def summary(self) -> str:
-        w = f"{self.wind_kn:.0f}" if self.wind_kn is not None else "--"
-        g = f" g{self.gust_kn:.0f}" if self.gust_kn is not None else ""
-        d = f" {self.wind_dir_deg}" + "\u00b0" if self.wind_dir_deg is not None else ""
-        return f"{w} kn{g}{d} ({self.age_min:.0f} min ago)"
+class SagamoreUnavailable(Exception):
+    """Sagamore cannot supply a usable current observation — fall back a tier."""
 
 
-# --- Unit handling -----------------------------------------------------------
-
-_TO_KNOTS = {
-    "mph": 0.868976,
-    "kt": 1.0,
-    "kts": 1.0,
-    "knots": 1.0,
-    "kn": 1.0,
-    "m/s": 1.94384,
-    "km/h": 0.539957,
-    "kph": 0.539957,
-}
+def _to_float(raw: Any, field: str) -> float:
+    if raw is None or raw == "":
+        raise SagamoreUnavailable(f"field '{field}' was empty")
+    try:
+        return float(str(raw).replace(",", ""))
+    except (TypeError, ValueError) as exc:
+        raise SagamoreUnavailable(f"field '{field}' not numeric: {raw!r}") from exc
 
 
-def _to_knots(value: float, unit: str | None) -> float:
-    """Davis stations in the US almost always report mph. Never assume — convert."""
-    if unit is None:
-        raise SourceUnavailable("wind speed returned with no unit label")
-    key = unit.strip().lower().replace(" ", "")
-    for candidate, factor in _TO_KNOTS.items():
-        if key == candidate.replace(" ", ""):
-            return value * factor
-    raise SourceUnavailable(f"unrecognized wind unit {unit!r}")
-
-
-# --- Embed backend -----------------------------------------------------------
-
-# The embed payload identifies each reading by a human-readable name. The key
-# holding that name has varied across WeatherLink releases, so check several.
-_NAME_KEYS = ("sensorDataName", "displayName", "name", "label")
-
-
-def _entry_name(entry: dict[str, Any]) -> str:
-    for k in _NAME_KEYS:
-        v = entry.get(k)
-        if isinstance(v, str) and v:
-            return v.strip().lower()
-    return ""
-
-
-def _find(entries: Iterable[dict[str, Any]], *needles: str) -> dict[str, Any] | None:
-    """
-    Match by NAME, not by array index. Index-based parsing (currConditionValues[0])
-    is what breaks every time Davis reorders the tiles on the embed page.
-    """
-    for entry in entries:
-        name = _entry_name(entry)
-        if all(n in name for n in needles):
-            return entry
-    return None
-
-
-def _numeric(entry: dict[str, Any] | None) -> float | None:
-    if not entry:
+def _opt_float(raw: Any) -> Optional[float]:
+    if raw is None or raw in ("", "--"):
         return None
-    for key in ("value", "convertedValue"):
-        raw = entry.get(key)
-        if raw in (None, "", "--"):
-            continue
-        try:
-            return float(str(raw).replace(",", ""))
-        except ValueError:
-            continue
-    return None
+    try:
+        return float(str(raw).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
 
 
-def fetch_embed(uuid: str = SYC_EMBED_UUID) -> Observation:
-    url = EMBED_URL.format(uuid=uuid)
-    # The cache-buster is what the page itself sends; without it you can get a
-    # stale CDN copy that never advances.
-    params = {"ts": int(time.time() * 1000)}
-    headers = {
-        "User-Agent": "WFC-weather-monitor/1.0 (waterfront safety monitoring)",
-        "Accept": "application/json",
+def _decode_units(raw: Optional[str]) -> str:
+    """WeatherLink returns temperature units as the HTML entity '&deg;F'."""
+    return "" if raw is None else raw.replace("&deg;", "°").strip()
+
+
+def _wind_factor(payload: dict) -> float:
+    units = (payload.get("windUnits") or "").strip().lower()
+    if units not in _TO_KNOTS:
+        raise SagamoreUnavailable(
+            f"unrecognized station wind units {units!r} — refusing to guess")
+    return _TO_KNOTS[units]
+
+
+def parse_sagamore(payload: dict, now: Optional[float] = None) -> dict:
+    """Parse a raw WeatherLink getData payload into the monitor's dict shape."""
+    now = time.time() if now is None else now
+
+    if not isinstance(payload, dict):
+        raise SagamoreUnavailable(f"payload was {type(payload).__name__}, not an object")
+    if payload.get("noAccess"):
+        raise SagamoreUnavailable("station embed reports noAccess (embed disabled?)")
+
+    last_received_ms = payload.get("lastReceived")
+    if not last_received_ms:
+        raise SagamoreUnavailable(
+            f"payload has no lastReceived timestamp (keys: {sorted(payload)[:12]})")
+    observed_epoch = float(last_received_ms) / 1000.0
+    age = now - observed_epoch
+    if age > MAX_AGE_SECONDS:
+        raise SagamoreUnavailable(
+            f"last report {age / 60:.1f} min old (limit {MAX_AGE_SECONDS / 60:.0f} min)")
+    if age < -MAX_FUTURE_SECONDS:
+        raise SagamoreUnavailable(
+            f"lastReceived is {abs(age) / 60:.1f} min in the future — clock skew?")
+
+    factor = _wind_factor(payload)
+    wind_kn = _to_float(payload.get("wind"), "wind") * factor
+    if not (0 <= wind_kn <= 100):
+        raise SagamoreUnavailable(f"implausible wind speed {wind_kn:.1f} kn")
+
+    direction = payload.get("windDirection")
+    wind_dir = int(float(direction)) % 360 if direction not in (None, "") else None
+
+    peak_gust = _opt_float(payload.get("gust"))
+    gust_at_ms = payload.get("gustAt")
+    temp_units = _decode_units(payload.get("tempUnits"))
+    temp = _opt_float(payload.get("temperature"))
+    if temp is not None and temp_units.endswith("C"):
+        temp = temp * 9 / 5 + 32
+
+    return {
+        # --- monitor contract ---
+        "wind_kn": wind_kn,
+        "gust_kn": None,                 # see THE GUST NOTE
+        "wind_dir_deg": wind_dir,
+        "observed_epoch": observed_epoch,
+        # --- display only ---
+        "station": STATION_LABEL,
+        "gust_monitored": False,
+        "peak_gust_kn": peak_gust * factor if peak_gust is not None else None,
+        "peak_gust_epoch": float(gust_at_ms) / 1000.0 if gust_at_ms else None,
+        "air_temp_f": temp,
+        "humidity_pct": _opt_float(payload.get("humidity")),
+        "barometer_in_hg": _opt_float(payload.get("barometer")),
+        "barometer_trend": (payload.get("barometerTrend") or "").strip() or None,
+        "rain_today_in": _opt_float(payload.get("rain")),
     }
 
+
+def fetch_raw(session: Optional[requests.Session] = None) -> dict:
+    """GET the embed payload. Raises SagamoreUnavailable with a readable reason."""
+    http = session or requests
+    headers = {"User-Agent": "WFC-weather-monitor/1.0 (waterfront safety monitoring)",
+               "Accept": "application/json"}
+    # Cache-buster: the embed page itself sends one; without it a CDN copy can go stale.
+    params = {"_": int(time.time() * 1000)}
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT_S)
+        r = http.get(ENDPOINT, params=params, headers=headers,
+                     timeout=REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
-    except requests.RequestException as e:
-        raise SourceUnavailable(f"embed request failed: {e}") from e
-
+    except requests.RequestException as exc:
+        raise SagamoreUnavailable(f"request failed: {exc}") from exc
     try:
-        payload = r.json()
-    except ValueError as e:
-        # Almost always means Davis served an HTML error/login page.
-        raise SourceUnavailable("embed returned non-JSON (endpoint may have moved)") from e
-
-    curr = payload.get("currConditionValues") or []
-    highs = payload.get("highLowValues") or []
-    if not curr:
-        raise SourceUnavailable("embed payload had no currConditionValues")
-
-    wind_entry = _find(curr, "wind", "speed")
-    wind_raw = _numeric(wind_entry)
-    if wind_raw is None:
-        raise SourceUnavailable("no wind speed in embed payload")
-    wind_unit = (wind_entry or {}).get("unitLabel")
-    wind_kn = _to_knots(wind_raw, wind_unit)
-
-    # Gust lives in current conditions on some stations, in the high/low block
-    # on others. Try both before giving up.
-    gust_entry = _find(curr, "gust") or _find(curr, "wind", "high") or _find(highs, "wind", "high")
-    gust_raw = _numeric(gust_entry)
-    gust_kn = _to_knots(gust_raw, (gust_entry or {}).get("unitLabel") or wind_unit) if gust_raw is not None else None
-
-    dir_entry = _find(curr, "wind", "direction") or _find(curr, "wind", "dir")
-    dir_raw = _numeric(dir_entry)
-    wind_dir = int(dir_raw) % 360 if dir_raw is not None else None
-
-    temp_raw = _numeric(_find(curr, "temp"))
-
-    observed_at = _embed_timestamp(payload)
-
-    obs = Observation(
-        source="Sagamore YC",
-        backend="weatherlink-embed",
-        wind_kn=wind_kn,
-        gust_kn=gust_kn,
-        wind_dir_deg=wind_dir,
-        air_temp_f=temp_raw,
-        observed_at=observed_at,
-    )
-    _check_fresh(obs)
-    return obs
+        return r.json()
+    except ValueError as exc:
+        snippet = r.text[:120].replace("\n", " ")
+        raise SagamoreUnavailable(
+            f"response was not JSON (status {r.status_code}): {snippet!r}") from exc
 
 
-def _embed_timestamp(payload: dict[str, Any]) -> datetime:
-    for key in ("lastReceived", "generatedAt", "lastReading", "timestamp"):
-        raw = payload.get(key)
-        if raw is None:
-            continue
-        try:
-            ts = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if ts > 1e11:      # epoch milliseconds
-            ts /= 1000.0
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
-    # No timestamp in the payload. Treating "now" as the observation time would
-    # let a frozen station look permanently fresh, so refuse instead.
-    raise SourceUnavailable("embed payload carried no observation timestamp")
-
-
-# --- v2 API backend ----------------------------------------------------------
-
-def fetch_v2() -> Observation:
-    if not (WL_API_KEY and WL_API_SECRET and SYC_STATION_ID):
-        raise SourceUnavailable("v2 API credentials not configured")
-
-    url = V2_URL.format(station_id=SYC_STATION_ID)
-    try:
-        r = requests.get(
-            url,
-            params={"api-key": WL_API_KEY},
-            headers={"X-Api-Secret": WL_API_SECRET},
-            timeout=TIMEOUT_S,
-        )
-        r.raise_for_status()
-        payload = r.json()
-    except (requests.RequestException, ValueError) as e:
-        raise SourceUnavailable(f"v2 API request failed: {e}") from e
-
-    # Pick the sensor block that actually carries wind data; a station can expose
-    # several (ISS, barometer, indoor console).
-    block = None
-    for sensor in payload.get("sensors", []):
-        for record in sensor.get("data", []):
-            if record.get("wind_speed_last") is not None or record.get("wind_speed_avg_last_1_min") is not None:
-                block = record
-                break
-        if block:
-            break
-    if block is None:
-        raise SourceUnavailable("v2 API response contained no wind sensor")
-
-    mph = block.get("wind_speed_avg_last_1_min", block.get("wind_speed_last"))
-    gust_mph = block.get("wind_speed_hi_last_2_min", block.get("wind_speed_hi_last_10_min"))
-    direction = block.get("wind_dir_scalar_avg_last_1_min", block.get("wind_dir_last"))
-
-    obs = Observation(
-        source="Sagamore YC",
-        backend="weatherlink-v2",
-        wind_kn=_to_knots(float(mph), "mph") if mph is not None else None,
-        gust_kn=_to_knots(float(gust_mph), "mph") if gust_mph is not None else None,
-        wind_dir_deg=int(direction) % 360 if direction is not None else None,
-        air_temp_f=block.get("temp"),
-        observed_at=datetime.fromtimestamp(block["ts"], tz=timezone.utc),
-    )
-    _check_fresh(obs)
-    return obs
-
-
-# --- Shared ------------------------------------------------------------------
-
-def _check_fresh(obs: Observation) -> None:
-    if obs.age_min > MAX_AGE_MIN:
-        raise SourceUnavailable(
-            f"observation is {obs.age_min:.0f} min old (limit {MAX_AGE_MIN})"
-        )
-    if obs.wind_kn is not None and not (0 <= obs.wind_kn <= 100):
-        raise SourceUnavailable(f"implausible wind speed {obs.wind_kn:.1f} kn")
-
-
-def fetch_sagamore() -> Observation:
-    """
-    Try each backend in order. Raises SourceUnavailable with every reason
-    collected, so the failure shows up in the Actions log instead of vanishing.
-    """
-    reasons = []
-    for backend in (fetch_v2, fetch_embed):
-        try:
-            obs = backend()
-            log.info("Sagamore OK via %s: %s", obs.backend, obs.summary())
-            return obs
-        except SourceUnavailable as e:
-            reasons.append(f"{backend.__name__}: {e}")
-            log.warning("Sagamore backend %s unavailable — %s", backend.__name__, e)
-    raise SourceUnavailable("; ".join(reasons))
+def fetch_sagamore(session: Optional[requests.Session] = None) -> dict:
+    """Fetch + parse the current Sagamore observation (monitor.py entry point)."""
+    return parse_sagamore(fetch_raw(session))
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # Run directly (or via the "Sagamore check" workflow) to see exactly what
+    # the feed returns and how it parses. Exit code 1 if unusable.
     try:
-        print(fetch_sagamore().summary())
-    except SourceUnavailable as e:
-        print(f"UNAVAILABLE — {e}")
+        raw = fetch_raw()
+    except SagamoreUnavailable as e:
+        print(f"FETCH FAILED — {e}")
         raise SystemExit(1)
+    print("RAW PAYLOAD:")
+    print(json.dumps(raw, indent=2)[:4000])
+    try:
+        obs = parse_sagamore(raw)
+    except SagamoreUnavailable as e:
+        print(f"\nPARSE FAILED — {e}")
+        raise SystemExit(1)
+    age = (time.time() - obs["observed_epoch"]) / 60
+    print(f"\nPARSED OK: {obs['wind_kn']:.1f} kn from {obs['wind_dir_deg']}° "
+          f"({age:.0f} min ago); peak gust today "
+          f"{obs['peak_gust_kn'] if obs['peak_gust_kn'] is not None else '--'} kn")
