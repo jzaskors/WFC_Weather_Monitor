@@ -1,13 +1,15 @@
 """
 render_conditions.py — builds the conditions graphic for WFC alert emails.
 
-Draws a compass rose showing wind speed/direction with the offshore arc shaded,
-plus a per-asset GO / CAUTION / HALT readout underneath.
+Draws a compass rose showing wind speed/direction with the offshore arc(s)
+shaded, plus a per-craft GO / CAUTION / HALT panel.
+
+Drawing only: the fleet calls and the offshore arcs come from the site file
+(sites/wfc.json) via the wxcore engine, so the graphic can never disagree
+with the alert it is attached to. Edit limits there, not here.
 
 Returns PNG bytes; monitor.py embeds it inline in the alert email.
 Requires Pillow (pip install pillow).
-
->>> EDIT THE FLEET TABLE BELOW to match your real operating limits. <<<
 """
 
 from io import BytesIO
@@ -17,28 +19,6 @@ try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     Image = None
-
-
-# ---------------------------------------------------------------------------
-# FLEET LIMITS  — knots. Edit these to your actual policy.
-#   caution / stop  = sustained wind
-#   gustCaution / gustStop = gusts
-#   offCaution / offStop  = sustained wind when it's blowing OFFSHORE
-#                           (out of the harbor). Only set for craft that can
-#                           be blown out and can't get back — paddle craft.
-#                           Leave as None for keelboats.
-# ---------------------------------------------------------------------------
-FLEET = [
-    # label,              caution, stop, gustCaution, gustStop, offCaution, offStop
-    ("Kayaks",                12,   16,   16,   20,    8,   13),
-    ("Paddleboards",          10,   14,   14,   18,    7,   11),
-    ("Sonars",                16,   22,   22,   28,  None, None),
-]
-
-# Wind blowing FROM this arc pushes craft out of the harbor (north-facing launch)
-OFFSHORE_ARC = (150, 240)
-
-ORDER = {"GO": 0, "CAUTION": 1, "STOP": 2}
 
 # Palette (matches the dashboard)
 INK = (11, 27, 43)
@@ -51,54 +31,6 @@ CAUTION = (232, 161, 60)
 STOP = (214, 69, 69)
 LEVEL_COLOR = {"GO": GO, "CAUTION": CAUTION, "STOP": STOP}
 LEVEL_WORD = {"GO": "GO", "CAUTION": "CAUTION", "STOP": "HALT"}
-
-
-def _in_arc(d, a, b):
-    if d is None:
-        return False
-    d = (d % 360 + 360) % 360
-    return (a <= d <= b) if a <= b else (d >= a or d <= b)
-
-
-def evaluate_asset(row, wind, gust, direction):
-    """Return (level, reason) for one asset given measured wind."""
-    label, cau, stop, gcau, gstop, ocau, ostop = row
-    level, reason = "GO", ""
-
-    def bump(lvl, why):
-        nonlocal level, reason
-        if ORDER[lvl] > ORDER[level]:
-            level, reason = lvl, why
-
-    offshore = _in_arc(direction, *OFFSHORE_ARC)
-    if wind is not None and ostop is not None and offshore:
-        if wind >= ostop:
-            bump("STOP", f"offshore {round(wind)} kn")
-        elif wind >= ocau:
-            bump("CAUTION", f"offshore {round(wind)} kn")
-    if wind is not None:
-        if wind >= stop:
-            bump("STOP", f"wind {round(wind)} kn")
-        elif wind >= cau:
-            bump("CAUTION", f"wind {round(wind)} kn")
-    if gust is not None:
-        if gust >= gstop:
-            bump("STOP", f"gusts {round(gust)} kn")
-        elif gust >= gcau:
-            bump("CAUTION", f"gusts {round(gust)} kn")
-    return level, reason
-
-
-def fleet_status(wind, gust, direction, force_stop_reason=None):
-    """Status for every asset. force_stop_reason (e.g. lightning) halts all."""
-    out = []
-    for row in FLEET:
-        if force_stop_reason:
-            out.append((row[0], "STOP", force_stop_reason))
-        else:
-            lvl, why = evaluate_asset(row, wind, gust, direction)
-            out.append((row[0], lvl, why))
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -118,12 +50,13 @@ def _text(d, xy, s, font, fill, anchor="la"):
     d.text(xy, s, font=font, fill=fill, anchor=anchor)
 
 
-def _draw_compass(d, cx, cy, r, wind, gust, direction, station):
-    # offshore arc wedge — the thing that matters most for paddle craft.
-    a0, a1 = OFFSHORE_ARC
+def _draw_compass(d, cx, cy, r, wind, gust, direction, station, arcs):
+    # offshore arc wedge(s) — the thing that matters most for paddle craft.
     # PIL angles: 0 = 3 o'clock, clockwise. Compass 0 = up. Convert: pil = comp - 90
-    d.pieslice([cx - r, cy - r, cx + r, cy + r],
-               a0 - 90, a1 - 90, fill=(58, 44, 16), outline=None)
+    for a0, a1 in arcs:
+        end = a1 if a1 >= a0 else a1 + 360          # arc that wraps through north
+        d.pieslice([cx - r, cy - r, cx + r, cy + r],
+                   a0 - 90, end - 90, fill=(58, 44, 16), outline=None)
 
     d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=LINE, width=2)
     d.ellipse([cx - r * 0.62, cy - r * 0.62, cx + r * 0.62, cy + r * 0.62],
@@ -145,10 +78,20 @@ def _draw_compass(d, cx, cy, r, wind, gust, direction, station):
         d.line([cx + math.cos(ang) * r * 0.93, cy + math.sin(ang) * r * 0.93,
                 cx + math.cos(ang) * r, cy + math.sin(ang) * r], fill=LINE, width=1)
 
-    # offshore label along the wedge
-    mid = math.radians(((a0 + a1) / 2) - 90)
-    _text(d, (cx + math.cos(mid) * r * 0.80, cy + math.sin(mid) * r * 0.80),
-          "OFFSHORE", _font(11, bold=True), CAUTION, anchor="mm")
+    # offshore label along each wedge
+    for a0, a1 in arcs:
+        end = a1 if a1 >= a0 else a1 + 360
+        mid_deg = (a0 + end) / 2
+        # If the wind arrow runs through the label, slide the label to the
+        # side of the wedge away from the arrow (staying inside the wedge).
+        if direction is not None:
+            off = ((direction - mid_deg + 180) % 360) - 180
+            if abs(off) < 25:
+                shift = min(30, (end - a0) / 2 - 12)
+                mid_deg += -shift if off >= 0 else shift
+        mid = math.radians(mid_deg - 90)
+        _text(d, (cx + math.cos(mid) * r * 0.80, cy + math.sin(mid) * r * 0.80),
+              "OFFSHORE", _font(11, bold=True), CAUTION, anchor="mm")
 
     # shoreline hint — launch faces north
     _text(d, (cx, cy - r - 34), "harbor / open water ↑", f_small, DIM, anchor="mm")
@@ -182,14 +125,15 @@ HEAD_H = 84           # title block
 FOOT_H = 44           # disclaimer strip
 
 
-def render_conditions_png(wind, gust, direction, station,
-                          force_stop_reason=None, headline=None):
+def render_conditions_png(wind, gust, direction, station, rows, arcs=(),
+                          headline=None):
     """Build the alert graphic. Returns PNG bytes, or None if Pillow is missing.
-    Height adapts to the number of assets so the panel is never stretched."""
+
+    rows: [(label, level, reason), ...] — the fleet calls from the engine.
+    arcs: [(from_deg, to_deg), ...] — offshore arcs from the site file.
+    Height adapts to the number of craft so the panel is never stretched."""
     if Image is None:
         return None
-
-    rows = fleet_status(wind, gust, direction, force_stop_reason)
     panel_h = 44 + len(rows) * ROW_H + 8
     compass_h = 268                       # diameter + label headroom
     content_h = max(panel_h, compass_h)
@@ -215,7 +159,7 @@ def render_conditions_png(wind, gust, direction, station,
 
     # compass, vertically centred in the content band
     r = 104
-    _draw_compass(d, 168, HEAD_H + content_h / 2, r, wind, gust, direction, station)
+    _draw_compass(d, 168, HEAD_H + content_h / 2, r, wind, gust, direction, station, arcs)
 
     # fleet panel, vertically centred alongside it
     x0 = 330
@@ -246,7 +190,9 @@ def render_conditions_png(wind, gust, direction, station,
 
 
 if __name__ == "__main__":
-    png = render_conditions_png(17, 23, 205, "Sagamore YC (in harbor)")
+    demo = [("Kayaks", "STOP", "offshore 17 kn"), ("Paddleboards", "STOP", "offshore 17 kn"),
+            ("Sonars", "CAUTION", "wind 17 kn")]
+    png = render_conditions_png(17, 23, 205, "Sagamore YC (in harbor)", demo, [(150, 240)])
     with open("preview.png", "wb") as f:
         f.write(png)
     print("wrote preview.png", len(png), "bytes")
