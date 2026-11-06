@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr, parseaddr
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -445,6 +446,9 @@ def send_sms(body):
     return ok > 0
 
 
+DEFAULT_FROM_NAME = "WFC Weather Monitor Alert System"
+
+
 def send_email(subject, text_body, html_body=None, image_png=None):
     """True sent, False failed after retry, None not configured."""
     host, user, pw = (os.environ.get(k) for k in ("SMTP_HOST", "SMTP_USER", "SMTP_PASS"))
@@ -453,7 +457,13 @@ def send_email(subject, text_body, html_body=None, image_png=None):
     except ValueError:
         log(f"SMTP_PORT secret is not a number ({os.environ.get('SMTP_PORT')!r}); using 587")
         port = 587
-    frm = os.environ.get("EMAIL_FROM") or user
+    # EMAIL_FROM may be a bare address or "Name <address>". EMAIL_FROM_NAME,
+    # if set, is the display name inboxes show. The bare address is what the
+    # mail server sends from, so it must be a sender verified in Brevo.
+    name_in_from, frm = parseaddr(os.environ.get("EMAIL_FROM") or user)
+    frm = frm or user
+    display = (os.environ.get("EMAIL_FROM_NAME") or name_in_from or DEFAULT_FROM_NAME).strip()
+    reply_to = (os.environ.get("EMAIL_REPLY_TO") or "").strip()
     to = _recipients("EMAIL_TO")
     if not (host and user and pw and to):
         log("Email not configured, skipping.")
@@ -472,7 +482,10 @@ def send_email(subject, text_body, html_body=None, image_png=None):
             msg.attach(img)
     else:
         msg = MIMEText(text_body, "plain", "utf-8")
-    msg["Subject"], msg["From"], msg["To"] = subject, frm, ", ".join(to)
+    msg["Subject"], msg["To"] = subject, ", ".join(to)
+    msg["From"] = formataddr((display, frm))
+    if reply_to:
+        msg["Reply-To"] = reply_to
 
     for attempt in range(1, SEND_ATTEMPTS + 1):
         try:
