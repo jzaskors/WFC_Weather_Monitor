@@ -36,6 +36,8 @@ jobs:
           SMTP_PASS:       ${{ secrets.SMTP_PASS }}
           EMAIL_FROM:      ${{ secrets.EMAIL_FROM }}
           EMAIL_TO:        ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME }}
+          EMAIL_REPLY_TO:  ${{ secrets.EMAIL_REPLY_TO }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
         run: python monitor.py
       # Always save state — even if the check step crashed — so a sent alert is
