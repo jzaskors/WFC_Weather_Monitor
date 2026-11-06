@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "id": "wfc",
+  "name": "The WaterFront Center",
+  "short_name": "WFC",
+  "area_name": "West Harbor",
+  "location": { "lat": 40.876, "lon": -73.530 },
+  "timezone": "America/New_York",
+  "operating_hours": { "open": 7, "close": 20 },
+  "alert_on_caution": true,
+  "clear_confirm_runs": 2,
+  "health_alert_after_runs": 3,
+
+  "offshore_arcs": [
+    { "from": 150, "to": 240, "note": "North-facing launch: S/SW winds push craft out of the harbor" }
+  ],
+
+  "shared_limits": {
+    "rain_caution_in_hr": 0.10,
+    "rain_stop_in_hr": 0.30,
+    "cape_watch": 1000,
+    "visibility_stop_mi": 0.5
+  },
+
+  "nws_marine_zones": ["ANZ335"],
+
+  "nws_routing": {
+    "stop": ["Tornado", "Special Marine", "Marine Warning", "Hurricane",
+             "Tropical Storm", "Gale", "Storm Warning"],
+    "caution": ["Thunderstorm"]
+  },
+
+  "activities": [
+    {
+      "id": "paddle",
+      "label": "Kayak / SUP rentals",
+      "limits": { "wind_caution": 12, "wind_stop": 16, "gust_caution": 16, "gust_stop": 20,
+                  "offshore_caution": 8, "offshore_stop": 13 }
+    },
+    {
+      "id": "sail",
+      "label": "Sailing programs",
+      "limits": { "wind_caution": 16, "wind_stop": 22, "gust_caution": 22, "gust_stop": 28 }
+    }
+  ],
+
+  "fleet": [
+    { "id": "kayaks", "label": "Kayaks",
+      "limits": { "wind_caution": 12, "wind_stop": 16, "gust_caution": 16, "gust_stop": 20,
+                  "offshore_caution": 8, "offshore_stop": 13 } },
+    { "id": "paddleboards", "label": "Paddleboards",
+      "limits": { "wind_caution": 10, "wind_stop": 14, "gust_caution": 14, "gust_stop": 18,
+                  "offshore_caution": 7, "offshore_stop": 11 } },
+    { "id": "sonars", "label": "Sonars",
+      "limits": { "wind_caution": 16, "wind_stop": 22, "gust_caution": 22, "gust_stop": 28 } }
+  ],
+
+  "observation_sources": [
+    { "id": "sagamore", "type": "weatherlink_embed", "label": "Sagamore YC (in harbor)",
+      "embed_id": "e9aef99860fc4aecb73f08d0d9cb3e37",
+      "exposure_offset_kn": 0, "max_age_min": 20, "has_live_gust": false },
+    { "id": "44040", "type": "ndbc", "label": "WLIS buoy (5 nm N)",
+      "station": "44040", "exposure_offset_kn": 2, "max_age_min": 90, "has_live_gust": true },
+    { "id": "kptn6", "type": "ndbc", "label": "Kings Point (11 mi WSW)",
+      "station": "KPTN6", "exposure_offset_kn": 2, "max_age_min": 90, "has_live_gust": true }
+  ],
+
+  "forecast_models": [
+    { "name": "HRRR", "open_meteo_id": "ncep_hrrr_conus", "label": "HRRR 3 km" },
+    { "name": "ICON", "open_meteo_id": "icon_seamless", "label": "ICON" },
+    { "name": "ECMWF", "open_meteo_id": "ecmwf_ifs025", "label": "ECMWF 9 km" }
+  ]
+}
