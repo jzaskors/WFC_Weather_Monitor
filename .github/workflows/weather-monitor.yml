@@ -1,5 +1,7 @@
 name: WFC Weather Monitor
 on:
+  # GitHub's own scheduler is unreliable; cron-job.org triggers workflow_dispatch
+  # every 10 min. The schedule below stays as a best-effort backup.
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
@@ -11,32 +13,51 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # A hung request must never block the next run for GitHub's 6-hour default.
+    # monitor.py caps its own fetching at 3 min, so this is generous headroom.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
       # pillow renders the compass / fleet graphic embedded in alert emails
-      - run: pip install -r requirements.txt pillow
+      - run: pip install -r requirements.txt
       - name: Check conditions and alert
         env:
-          TWILIO_SID:   ${{ secrets.TWILIO_SID }}
-          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
-          TWILIO_FROM:  ${{ secrets.TWILIO_FROM }}
-          ALERT_SMS_TO: ${{ secrets.ALERT_SMS_TO }}
-          SMTP_HOST:    ${{ secrets.SMTP_HOST }}
-          SMTP_PORT:    ${{ secrets.SMTP_PORT }}
-          SMTP_USER:    ${{ secrets.SMTP_USER }}
-          SMTP_PASS:    ${{ secrets.SMTP_PASS }}
-          EMAIL_FROM:   ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO:     ${{ secrets.EMAIL_TO }}
+          TWILIO_SID:      ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN:    ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM:     ${{ secrets.TWILIO_FROM }}
+          ALERT_SMS_TO:    ${{ secrets.ALERT_SMS_TO }}
+          SMTP_HOST:       ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:       ${{ secrets.SMTP_PORT }}
+          SMTP_USER:       ${{ secrets.SMTP_USER }}
+          SMTP_PASS:       ${{ secrets.SMTP_PASS }}
+          EMAIL_FROM:      ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:        ${{ secrets.EMAIL_TO }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
         run: python monitor.py
+      # Always save state — even if the check step crashed — so a sent alert is
+      # never forgotten and re-sent. Retries if another run pushed first.
       - name: Persist state
+        if: always()
         run: |
-          if [[ -n "$(git status --porcelain state.json)" ]]; then
-            git config user.name "weather-bot"
-            git config user.email "bot@users.noreply.github.com"
+          [[ -f state.json ]] || exit 0
+          if [[ -z "$(git status --porcelain state.json)" ]]; then exit 0; fi
+          git config user.name "weather-bot"
+          git config user.email "bot@users.noreply.github.com"
+          cp state.json "$RUNNER_TEMP/state.json"
+          for i in 1 2 3; do
+            # Start each try from the latest remote, then lay this run's state on top.
+            git fetch -q origin "$GITHUB_REF_NAME"
+            git reset -q --hard "origin/$GITHUB_REF_NAME"
+            cp "$RUNNER_TEMP/state.json" state.json
+            if [[ -z "$(git status --porcelain state.json)" ]]; then exit 0; fi
             git add state.json
-            git commit -m "update state [skip ci]"
-            git push
-          fi
+            git commit -q -m "update state [skip ci]"
+            git push -q && exit 0
+            sleep $((i * 5))
+          done
+          echo "::error::Could not push state.json after 3 tries"
+          exit 1
