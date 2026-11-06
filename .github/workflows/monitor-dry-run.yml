@@ -1,0 +1,24 @@
+name: Monitor dry run
+# Manual check: Actions tab -> "Monitor dry run" -> Run workflow.
+# Runs the real monitor against live data and prints every call and every
+# message it WOULD send. Sends nothing, changes nothing.
+on:
+  workflow_dispatch:
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run monitor (dry run)
+        env:
+          DRY_RUN: "1"
+        run: python monitor.py
+      - name: Show the status snapshot
+        if: always()
+        run: cat status.json || echo "no status.json was written"
