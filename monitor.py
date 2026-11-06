@@ -1,92 +1,355 @@
 #!/usr/bin/env python3
 """
 WFC West Harbor weather monitor.
-Checks live conditions and sends SMS (Twilio) + email when paddle rentals or
-sailing programs should HALT, and an all-clear when they reopen.
 
-Mirrors the decision logic in the dashboard. Edit THRESHOLDS to keep them in sync.
-Designed to run every ~10 min on a scheduler (e.g. GitHub Actions cron).
-State is persisted in state.json so you only get alerted on a *change*, not every run.
+Checks live conditions every ~10 minutes and emails (and texts, if Twilio is
+set up) when paddle rentals or sailing programs should HALT or use CAUTION,
+and again when they clear.
 
-Observed-data priority: Sagamore YC station (in-harbor, no offset) ->
-NDBC 44040 -> KPTN6 (both exposure-offset). Requires sagamore.py alongside.
+How it decides
+  The rules live in wxcore/ and the WFC settings live in sites/wfc.json:
+  limits, offshore arc, hours, stations, and NWS routing. Edit limits there,
+  never in this file. This file only fetches data, sends messages, and
+  remembers state between runs.
+
+What it does when things go wrong
+  - A source is down: falls back to the next source and says so in the alert.
+  - No wind data at all: holds the last call. It never sends an all-clear
+    because data went missing.
+  - An alert fails to send: doesn't record it as sent, so the next run
+    tries again.
+  - A source stays down for several runs: one "monitor degraded" email, then
+    one "back to normal" email when it recovers.
+  - The monitor stops running entirely: the optional dead-man's switch
+    (HEALTHCHECK_URL) emails you when the pings stop.
+
+State is kept in state.json between runs (committed back by the workflow).
 """
+
+from __future__ import annotations
 
 import json
 import os
 import smtplib
 import sys
-from datetime import datetime
+import time
+import traceback
+from datetime import datetime, timezone
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
 
-# Sagamore YC WeatherLink fetcher (sagamore.py in the same folder).
-# If the file is missing, the monitor still runs on buoys alone.
-try:
-    from sagamore import fetch_sagamore
-except Exception as _e:
-    print(f"!!! sagamore module unavailable ({_e}); using buoys only. "
-          f"Check that the file is named lowercase 'sagamore.py' — the runner "
-          f"is case-sensitive.")
-    fetch_sagamore = None
+from wxcore import (Conditions, Observation, LEVEL_WORD, ORDER, advance, assess,
+                    in_operating_hours, load_site)
 
-# Conditions graphic for alert emails (render_conditions.py, needs Pillow).
-# If unavailable the alerts still send — just without the picture.
+ROOT = Path(__file__).resolve().parent
+SITE = load_site(os.environ.get("SITE_FILE") or ROOT / "sites" / "wfc.json")
+TZ = ZoneInfo(SITE.timezone)
+STATE_FILE = ROOT / "state.json"
+STATUS_FILE = ROOT / "status.json"
+STATE_VERSION = 2
+
+USER_AGENT = "WFC-weather-monitor (ops@thewaterfrontcenter.org)"
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": USER_AGENT})
+HTTP_ATTEMPTS = 2          # one retry per request
+RETRY_DELAY_S = 3
+# Whole-run budget for fetching. Once spent, no retries and short timeouts, so
+# a total outage finishes well inside the workflow's time limit and state is
+# always saved.
+FETCH_BUDGET_S = 180
+_run_started = time.monotonic()
+
+
+def budget_left() -> float:
+    return FETCH_BUDGET_S - (time.monotonic() - _run_started)
+SEND_ATTEMPTS = 2
+# DRY_RUN=1: run every real check and print what WOULD be sent, but send
+# nothing, ping nothing, and leave state.json untouched. Safe to run any time.
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+# Sagamore YC WeatherLink fetcher (sagamore.py, same folder, lowercase name).
 try:
-    from render_conditions import render_conditions_png, fleet_status
+    from sagamore import fetch_sagamore, SagamoreUnavailable
 except Exception as _e:
-    print(f"render_conditions unavailable ({_e}); alerts will be text-only")
+    print(f"!!! sagamore module unavailable ({_e}); Sagamore will be skipped. "
+          f"The file must be named lowercase 'sagamore.py' — the runner is case-sensitive.")
+    fetch_sagamore, SagamoreUnavailable = None, Exception
+
+# Conditions graphic (render_conditions.py + Pillow). Optional: alerts still
+# go out as HTML + text without it.
+try:
+    from render_conditions import render_conditions_png
+except Exception as _e:
+    print(f"render_conditions unavailable ({_e}); alerts will have no graphic")
     render_conditions_png = None
-    fleet_status = None
-
-# ----------------------------------------------------------------------------
-# SITE + THRESHOLDS  (keep in sync with the dashboard)
-# ----------------------------------------------------------------------------
-LAT, LON = 40.876, -73.530
-TZ = ZoneInfo("America/New_York")
-
-# Only alert during operating hours (24h clock, local time)
-OPEN_HOUR, CLOSE_HOUR = 7, 20
-
-# Also alert when status enters CAUTION (not just HALT)? True = yes, you'll get
-# a heads-up at CAUTION and a second alert if it escalates to HALT.
-ALERT_ON_CAUTION = True
-
-THRESHOLDS = {
-    "paddle": {"windCaution": 12, "windStop": 16, "gustCaution": 16, "gustStop": 20,
-               "offWindCaution": 8, "offWindStop": 13},
-    "sail":   {"windCaution": 16, "windStop": 22, "gustCaution": 22, "gustStop": 28},
-    "shared": {"rainCaution": 0.10, "rainStop": 0.30, "capeWatch": 1000, "visStopMi": 0.5},
-    # Offshore wind arc (degrees the wind blows FROM). North-facing launch -> S/SW = offshore.
-    "offshoreArc": {"from": 150, "to": 240},
-}
-
-LABELS = {"paddle": "Kayak / SUP rentals", "sail": "Sailing programs"}
-ORDER = {"GO": 0, "CAUTION": 1, "STOP": 2}
-COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
-STATE_FILE = "state.json"
 
 
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
+def now_local() -> datetime:
+    return datetime.now(TZ)
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+# ============================================================================
+# Fetching
+# ============================================================================
+class SourceError(Exception):
+    """A source could not supply usable data; the message says why."""
+
+
+def http_get(url, *, params=None, timeout=20, headers=None):
+    """GET with one retry. Raises SourceError with a readable reason."""
+    last = None
+    for attempt in range(1, HTTP_ATTEMPTS + 1):
+        left = budget_left()
+        if left <= 0 and attempt > 1:
+            break
+        try:
+            r = HTTP.get(url, params=params, timeout=max(3, min(timeout, left)), headers=headers)
+            r.raise_for_status()
+            return r
+        except requests.RequestException as e:
+            last = e
+            if attempt < HTTP_ATTEMPTS and budget_left() > RETRY_DELAY_S + 3:
+                time.sleep(RETRY_DELAY_S)
+            else:
+                break
+    raise SourceError(f"{type(last).__name__}: {last}")
+
+
+def http_json(url, **kw):
+    r = http_get(url, **kw)
+    try:
+        return r.json()
+    except ValueError:
+        raise SourceError(f"not JSON (HTTP {r.status_code}): {r.text[:100]!r}")
+
+
+# --- Open-Meteo forecast models ---------------------------------------------
+OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
+CUR_FIELDS = ("temperature_2m,precipitation,weather_code,wind_speed_10m,"
+              "wind_direction_10m,wind_gusts_10m,cape,visibility")
+
+
+def _pick(d, base):
+    """d[base], tolerating model-suffixed keys (wind_speed_10m_ncep_hrrr_conus)."""
+    if d.get(base) is not None:
+        return d[base]
+    for k, v in d.items():
+        if k.startswith(base + "_") and v is not None:
+            return v
+    return None
+
+
+def _forecast_params(model_id=None):
+    p = {"latitude": SITE.lat, "longitude": SITE.lon, "current": CUR_FIELDS,
+         "wind_speed_unit": "kn", "temperature_unit": "fahrenheit",
+         "precipitation_unit": "inch", "timezone": SITE.timezone}
+    if model_id:
+        p["models"] = model_id
+    return p
+
+
+def parse_current(c: dict) -> dict:
+    """Open-Meteo 'current' block -> plain values.
+
+    Open-Meteo's current precipitation is the TOTAL over the preceding
+    interval (15 min, given in seconds as `interval`), not an hourly rate.
+    The rain limits are inches per HOUR, so convert. Before Nov 2026 this was
+    compared raw, which made rain read about 4x lighter than it was.
+    """
+    vis = _pick(c, "visibility")
+    precip = _pick(c, "precipitation")
+    interval_s = c.get("interval") or 900
+    return {
+        "temp_f": _pick(c, "temperature_2m"),
+        "precip_in_hr": None if precip is None else precip * 3600 / interval_s,
+        "weather_code": _pick(c, "weather_code"),
+        "wind": _pick(c, "wind_speed_10m"),
+        "dir": _pick(c, "wind_direction_10m"),
+        "gust": _pick(c, "wind_gusts_10m"),
+        "cape": _pick(c, "cape"),
+        "vis_mi": None if vis is None else vis / 1609.34,
+    }
+
+
+def fetch_forecast() -> dict:
+    """Primary model plus cross-check. Never raises; 'primary' is None if
+    every model failed."""
+    runs, errors = {}, []
+    for m in SITE.forecast_models:
+        try:
+            runs[m.name] = parse_current(http_json(OPEN_METEO, params=_forecast_params(m.open_meteo_id))
+                                         .get("current") or {})
+        except SourceError as e:
+            errors.append(f"{m.name}: {e}")
+            log(f"forecast model {m.name} failed: {e}")
+
+    primary, source = None, None
+    for m in SITE.forecast_models:                 # site file order = priority
+        r = runs.get(m.name)
+        if r and r["wind"] is not None:
+            primary, source = r, m.label
+            break
+    if primary is None:
+        try:
+            r = parse_current(http_json(OPEN_METEO, params=_forecast_params()).get("current") or {})
+            if r["wind"] is not None:
+                primary, source = r, "global best-match (preferred models unavailable)"
+        except SourceError as e:
+            errors.append(f"best-match: {e}")
+
+    winds = {n: round(r["wind"]) for n, r in runs.items() if r and r["wind"] is not None}
+    return {"primary": primary, "source": source, "agreement": assess_agreement(winds),
+            "errors": errors}
+
+
+def assess_agreement(model_winds: dict) -> dict:
+    if len(model_winds) < 2:
+        return {"level": "SINGLE-SOURCE", "spread": None, "winds": model_winds}
+    spread = max(model_winds.values()) - min(model_winds.values())
+    level = "HIGH" if spread <= 3 else "MODERATE" if spread <= 6 else "LOW"
+    return {"level": level, "spread": spread, "winds": model_winds}
+
+
+def fetch_marine() -> dict:
+    """Waves / water temp — display only, never decides a call."""
+    try:
+        m = http_json("https://marine-api.open-meteo.com/v1/marine",
+                      params={"latitude": SITE.lat, "longitude": SITE.lon,
+                              "current": "wave_height,sea_surface_temperature",
+                              "timezone": SITE.timezone}).get("current") or {}
+    except SourceError as e:
+        log(f"marine fetch failed (display only): {e}")
+        return {}
+    wave, sst = m.get("wave_height"), m.get("sea_surface_temperature")
+    return {"wave_ft": None if wave is None else wave * 3.281,
+            "sst_f": None if sst is None else sst * 9 / 5 + 32}
+
+
+# --- NWS alerts ----------------------------------------------------------------
+def fetch_nws() -> dict:
+    """Active NWS alerts for the site's point AND its marine zone(s).
+
+    Marine products (Small Craft Advisory, Gale Warning, Special Marine
+    Warning) are issued for water zones, so a point query at a dock on land
+    can miss them. The zone query makes sure they're seen. ok is False if
+    ANY query failed — the alert says what couldn't be checked, and no
+    all-clear goes out until every query answers.
+    """
+    queries = [("point", {"point": f"{SITE.lat},{SITE.lon}"})]
+    queries += [(f"zone {z}", {"zone": z}) for z in SITE.nws_marine_zones]
+    names, failed = set(), []
+    for label, params in queries:
+        try:
+            data = http_json("https://api.weather.gov/alerts/active", params=params,
+                             headers={"Accept": "application/geo+json"})
+            for feat in data.get("features", []):
+                ev = (feat.get("properties") or {}).get("event")
+                if ev:
+                    names.add(ev)
+        except SourceError as e:
+            failed.append(label)
+            log(f"NWS {label} query failed: {e}")
+    # ok only if EVERY query answered: a missing zone query means marine
+    # warnings went unchecked, which must block any all-clear.
+    return {"names": sorted(names), "ok": not failed, "failed": failed}
+
+
+# --- Live observations ---------------------------------------------------------
+MS_TO_KN = 1.94384
+
+
+def _obs_weatherlink_embed(src) -> Observation:
+    if fetch_sagamore is None:
+        raise SourceError("sagamore.py not importable")
+    try:
+        s = fetch_sagamore(session=HTTP)
+    except SagamoreUnavailable as e:
+        raise SourceError(str(e))
+    except Exception as e:
+        raise SourceError(f"{type(e).__name__}: {e}")
+    if not isinstance(s, dict) or s.get("wind_kn") is None:
+        raise SourceError(f"unusable data: {s!r}"[:200])
+    age = (time.time() - s["observed_epoch"]) / 60 if s.get("observed_epoch") else 0
+    if age > src.max_age_min:
+        raise SourceError(f"stale ({age:.0f} min old)")
+    return Observation(wind_kn=s["wind_kn"], gust_kn=s.get("gust_kn"), dir_deg=s.get("wind_dir_deg"),
+                       station=src.label, age_min=max(age, 0),
+                       exposure_offset_kn=src.exposure_offset_kn,
+                       gust_monitored=s.get("gust_monitored", s.get("gust_kn") is not None),
+                       peak_gust_kn=s.get("peak_gust_kn"))
+
+
+def _obs_ndbc(src) -> Observation:
+    sid = src.params["station"]
+    txt = http_get(f"https://www.ndbc.noaa.gov/data/realtime2/{sid}.txt").text
+    rows = [l.split() for l in txt.splitlines() if l.strip() and not l.startswith("#")]
+    if not rows or len(rows[0]) < 8:
+        raise SourceError("no data rows")
+    p = rows[0]                                    # newest first
+    try:
+        t = datetime(int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4]), tzinfo=timezone.utc)
+    except ValueError:
+        raise SourceError(f"bad timestamp {p[:5]}")
+    age = (datetime.now(timezone.utc) - t).total_seconds() / 60
+    if age > src.max_age_min:
+        raise SourceError(f"stale ({age:.0f} min old)")
+
+    def num(v):
+        return None if v in ("MM", "") else float(v)
+
+    wdir, wspd, gst = num(p[5]), num(p[6]), num(p[7])
+    if wspd is None:
+        raise SourceError("wind missing")
+    return Observation(wind_kn=wspd * MS_TO_KN, gust_kn=None if gst is None else gst * MS_TO_KN,
+                       dir_deg=wdir, station=src.label, age_min=max(age, 0),
+                       exposure_offset_kn=src.exposure_offset_kn)
+
+
+OBS_FETCHERS = {"weatherlink_embed": _obs_weatherlink_embed, "ndbc": _obs_ndbc}
+
+
+def fetch_observation() -> tuple:
+    """(best Observation or None, [(label, why it was skipped), ...])
+    in the site file's priority order."""
+    skipped = []
+    for src in SITE.observation_sources:
+        fn = OBS_FETCHERS.get(src.type)
+        if fn is None:
+            skipped.append((src.label, f"unsupported source type '{src.type}'"))
+            continue
+        try:
+            obs = fn(src)
+            if skipped:
+                log(f"observation from backup {src.label}; skipped: {skipped}")
+            return obs, skipped
+        except (SourceError, KeyError, ValueError) as e:
+            skipped.append((src.label, str(e)))
+            log(f"obs {src.label} unavailable: {e}")
+    return None, skipped
+
+
+# ============================================================================
+# Text formatting (every value may be missing)
+# ============================================================================
+COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+           "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
 def compass(d):
     return "—" if d is None else COMPASS[round((d % 360) / 22.5) % 16]
 
 
-def in_arc(d, a, b):
-    if d is None:
-        return False
-    d = (d % 360 + 360) % 360
-    return (a <= d <= b) if a <= b else (d >= a or d <= b)
-
-
-def is_storm(code):
-    return code in (95, 96, 99)
+def kn(v):
+    return "—" if v is None else f"{round(v)}"
 
 
 def wx_text(c):
@@ -101,68 +364,29 @@ def wx_text(c):
     return "—"
 
 
-# ----------------------------------------------------------------------------
-# Fetch  (multi-model: HRRR primary, ICON + ECMWF for agreement / fallback)
-# ----------------------------------------------------------------------------
-# Open-Meteo model IDs. HRRR (ncep_hrrr_conus) is the high-res US short-range
-# model — best for the harbor inside ~2 days. ICON + ECMWF are the cross-check
-# and the fallback if HRRR has a coverage/run gap.
-MODELS = {"HRRR": "ncep_hrrr_conus", "ICON": "icon_seamless", "ECMWF": "ecmwf_ifs025"}
-CUR_FIELDS = ("temperature_2m,precipitation,weather_code,wind_speed_10m,"
-              "wind_direction_10m,wind_gusts_10m,cape,visibility")
-SRC_LABEL = {"HRRR": "HRRR 3 km", "ICON": "ICON", "ECMWF": "ECMWF 9 km",
-             "best-match": "global best-match (HRRR unavailable)"}
+def conditions_line(fc, marine):
+    if not fc:
+        return "Forecast unavailable"
+    rain = "—" if fc["precip_in_hr"] is None else f"{fc['precip_in_hr']:.2f} in/hr"
+    s = (f"Wind {kn(fc['wind'])} kn {compass(fc['dir'])}, gusts {kn(fc['gust'])} kn, "
+         f"{wx_text(fc['weather_code'])}, rain {rain}")
+    if marine.get("wave_ft") is not None:
+        s += f", waves {marine['wave_ft']:.1f} ft"
+    return s
 
 
-def _pick(d, base):
-    """Return d[base], tolerating model-suffixed keys
-    (e.g. wind_speed_10m_ncep_hrrr_conus) that appear when models= is used."""
-    if d.get(base) is not None:
-        return d[base]
-    for k, v in d.items():
-        if (k == base or k.startswith(base + "_")) and v is not None:
-            return v
-    return None
-
-
-def _forecast_url(model_id=None):
-    url = ("https://api.open-meteo.com/v1/forecast"
-           f"?latitude={LAT}&longitude={LON}&current={CUR_FIELDS}"
-           "&wind_speed_unit=kn&temperature_unit=fahrenheit&precipitation_unit=inch"
-           "&timezone=America%2FNew_York")
-    return url + (f"&models={model_id}" if model_id else "")
-
-
-def _parse_current(c):
-    vis = _pick(c, "visibility")
-    return {
-        "temp": _pick(c, "temperature_2m"),
-        "precip": _pick(c, "precipitation"),
-        "weatherCode": _pick(c, "weather_code"),
-        "wind": _pick(c, "wind_speed_10m"),
-        "dir": _pick(c, "wind_direction_10m"),
-        "gust": _pick(c, "wind_gusts_10m"),
-        "cape": _pick(c, "cape"),
-        "visMi": vis / 1609.34 if vis is not None else None,
-    }
-
-
-def _fetch_model(model_id):
-    try:
-        c = requests.get(_forecast_url(model_id), timeout=20).json().get("current", {}) or {}
-        return _parse_current(c)
-    except Exception as e:
-        print(f"model {model_id} fetch failed: {e}")
-        return None
-
-
-def assess_agreement(model_winds):
-    """Confidence based on how closely the models agree on sustained wind."""
-    if len(model_winds) < 2:
-        return {"level": "SINGLE-SOURCE", "spread": None, "winds": model_winds}
-    spread = max(model_winds.values()) - min(model_winds.values())
-    level = "HIGH" if spread <= 3 else "MODERATE" if spread <= 6 else "LOW"
-    return {"level": level, "spread": spread, "winds": model_winds}
+def obs_line(obs):
+    if obs is None:
+        return "Observed: unavailable (no station reporting)"
+    if obs.gust_kn is not None:
+        g = f" g{round(obs.gust_kn)}"
+    elif not obs.gust_monitored:
+        g = " (gust not reported by station"
+        g += f"; peak today {round(obs.peak_gust_kn)} kn)" if obs.peak_gust_kn is not None else ")"
+    else:
+        g = ""
+    return (f"Observed at {obs.station}: {kn(obs.wind_kn)} kn{g} {compass(obs.dir_deg)} "
+            f"({round(obs.age_min)} min ago)")
 
 
 def agreement_line(ag):
@@ -172,534 +396,434 @@ def agreement_line(ag):
     return f"Model agreement: {ag['level']} (spread {ag['spread']} kn — {parts})"
 
 
-# ----------------------------------------------------------------------------
-# Real-time observations. These are MEASURED conditions, not forecasts.
-# Priority:
-#   1. Sagamore YC station — IN the harbor next door. Most representative;
-#      judged against thresholds as-is (offset 0).
-#   2. 44040 (WLIS buoy, ~5 nm N in the Sound) — closest buoy but intermittent.
-#   3. KPTN6 (Kings Point NOAA station, ~11 mi WSW) — the reliable fallback.
-# Buoy/coastal stations sit in more exposed water than the sheltered harbor,
-# so their readings are judged against thresholds raised by the offset below.
-# ----------------------------------------------------------------------------
-OBS_STATIONS = [("44040", "WLIS buoy (5 nm N)"), ("KPTN6", "Kings Point (11 mi WSW)")]
-OBS_MAX_AGE_MIN = 90          # ignore observations older than this
-MS_TO_KN = 1.94384
-OBS_EXPOSURE_OFFSET_KN = 2    # applied to buoy/coastal stations only, never Sagamore
+def data_gap_notes(fc, obs, skipped, nws) -> list:
+    """Plain-language list of anything missing, so a quiet email never reads
+    as 'checked and fine' when it wasn't checked."""
+    notes = []
+    if fc["primary"] is None:
+        notes.append("Forecast models unavailable — storm, rain, visibility and instability "
+                     "were NOT checked this run")
+    if obs is None:
+        notes.append("No live station reporting — call is forecast-only")
+    elif skipped:
+        notes.append(f"Using backup station {obs.station} "
+                     f"({skipped[0][0]} unavailable: {skipped[0][1]})")
+    if not nws["ok"]:
+        notes.append(f"NWS alerts could not be checked this run ({', '.join(nws['failed'])})")
+    return notes
 
 
-def _fetch_sagamore_obs():
-    """Sagamore YC station via WeatherLink; normalized to the common obs shape.
-    Returns None if the module is absent, the station is offline, or data is
-    stale — the caller then falls through to the buoys."""
-    if fetch_sagamore is None:
-        return None
-    try:
-        s = fetch_sagamore()
-    except Exception as e:
-        print(f"sagamore fetch failed: {e}")
-        return None
-    if not isinstance(s, dict) or s.get("wind_kn") is None:
-        print(f"sagamore returned unusable data: {s!r}")
-        return None
-    if s.get("observed_epoch"):
-        from datetime import timezone
-        age_min = (datetime.now(timezone.utc).timestamp() - s["observed_epoch"]) / 60
-    else:
-        age_min = 0   # feed omits timestamp; sagamore.py already rejects stale data
-    return {
-        "wind": s["wind_kn"],
-        "gust": s.get("gust_kn"),
-        "dir": s.get("wind_dir_deg"),
-        "station": "Sagamore YC (in harbor)",
-        "age_min": round(age_min),
-        "offset": 0,   # in-harbor station: thresholds apply as-is
-        # The WeatherLink feed has no live gust (only the daily peak), so gust
-        # is None here. Flag it so the email says so instead of going blank.
-        "gust_monitored": s.get("gust_monitored", s.get("gust_kn") is not None),
-        "peak_gust": s.get("peak_gust_kn"),
-    }
+# ============================================================================
+# Sending
+# ============================================================================
+def _recipients(var):
+    return [x.strip() for x in os.environ.get(var, "").split(",") if x.strip()]
 
 
-def _fetch_ndbc_obs():
-    """Newest usable NDBC observation in kn, or None."""
-    from datetime import timezone
-    for sid, label in OBS_STATIONS:
-        try:
-            txt = requests.get(f"https://www.ndbc.noaa.gov/data/realtime2/{sid}.txt",
-                               timeout=20).text
-            lines = [l for l in txt.splitlines() if l.strip() and not l.startswith("#")]
-            if not lines:
-                continue
-            # Standard met format: YY MM DD hh mm WDIR WSPD GST ... (UTC, m/s)
-            p = lines[0].split()
-            obs_time = datetime(int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4]),
-                                tzinfo=timezone.utc)
-            age_min = (datetime.now(timezone.utc) - obs_time).total_seconds() / 60
-            if age_min > OBS_MAX_AGE_MIN:
-                print(f"obs {sid}: stale ({age_min:.0f} min old), skipping")
-                continue
-
-            def num(v):
-                return None if v in ("MM", "") else float(v)
-
-            wdir, wspd, gust = num(p[5]), num(p[6]), num(p[7])
-            if wspd is None:
-                print(f"obs {sid}: wind missing, skipping")
-                continue
-            return {
-                "wind": wspd * MS_TO_KN,
-                "gust": gust * MS_TO_KN if gust is not None else None,
-                "dir": wdir,
-                "station": label,
-                "age_min": round(age_min),
-                "offset": OBS_EXPOSURE_OFFSET_KN,
-            }
-        except Exception as e:
-            print(f"obs {sid} fetch failed: {e}")
-    return None
-
-
-def fetch_observations():
-    """Best available measured conditions: Sagamore first, then buoys."""
-    obs = _fetch_sagamore_obs()
-    if obs:
-        return obs
-    print("Sagamore unavailable — falling back to NDBC stations")
-    return _fetch_ndbc_obs()
-
-
-def obs_line(obs):
-    if not obs:
-        return "Observed: unavailable (no reporting station)"
-    if obs["gust"] is not None:
-        g = f" g{round(obs['gust'])}"
-    elif obs.get("gust_monitored", True) is False:
-        pk = obs.get("peak_gust")
-        g = " (gust not reported by station"
-        g += f"; peak today {round(pk)} kn)" if pk is not None else ")"
-    else:
-        g = ""
-    return (f"Observed at {obs['station']}: {round(obs['wind'])} kn"
-            f"{g} {compass(obs['dir'])} ({obs['age_min']} min ago)")
-
-
-_WIND_KEYS = ("windCaution", "windStop", "gustCaution", "gustStop",
-              "offWindCaution", "offWindStop")
-
-
-def _offset_thresholds(offset):
-    th = {k: (dict(v) if isinstance(v, dict) else v) for k, v in THRESHOLDS.items()}
-    for act in ("paddle", "sail"):
-        for k in _WIND_KEYS:
-            if k in th[act]:
-                th[act][k] = th[act][k] + offset
-    return th
-
-
-def evaluate_observed(activity, obs):
-    """Run MEASURED wind through the thresholds. Sagamore (offset 0) is judged
-    against limits as-is; buoy stations against limits raised by their exposure
-    offset. Reported values stay the true measured ones."""
-    if not obs:
-        return "GO", []
-    offset = obs.get("offset", 0)
-    cur = {"storm": False, "precip": None, "visMi": None, "cape": None,
-           "wind": obs["wind"], "dir": obs["dir"], "gust": obs["gust"]}
-    level, reasons = evaluate(activity, cur, False,
-                              thresholds=_offset_thresholds(offset))
-    if offset:
-        tag = (f" — MEASURED at {obs['station']} "
-               f"(judged vs +{offset} kn exposure-adjusted limits)")
-    else:
-        tag = f" — MEASURED at {obs['station']}"
-    tagged = [(l, f"{r}{tag}") for l, r in reasons]
-    return level, tagged
-
-
-def fetch_conditions():
-    # Pull each model independently so one failing can't break the others
-    runs = {name: _fetch_model(mid) for name, mid in MODELS.items()}
-
-    # Primary = HRRR; fall back through ICON, ECMWF, then global best-match
-    primary, source = None, None
-    for name in ("HRRR", "ICON", "ECMWF"):
-        r = runs.get(name)
-        if r and r["wind"] is not None:
-            primary, source = r, name
-            break
-    if primary is None:
-        try:
-            c = requests.get(_forecast_url(), timeout=20).json().get("current", {})
-            primary, source = _parse_current(c), "best-match"
-        except Exception as e:
-            raise RuntimeError(f"All weather-model fetches failed: {e}")
-
-    # Marine (waves / SST) and NWS alerts
-    try:
-        mar = ("https://marine-api.open-meteo.com/v1/marine"
-               f"?latitude={LAT}&longitude={LON}"
-               "&current=wave_height,sea_surface_temperature&timezone=America%2FNew_York")
-        m = requests.get(mar, timeout=20).json().get("current", {}) or {}
-    except Exception:
-        m = {}
-
-    alerts = []
-    try:
-        nws = f"https://api.weather.gov/alerts/active?point={LAT},{LON}"
-        a = requests.get(nws, timeout=20,
-                         headers={"User-Agent": "WFC-weather-monitor (ops@thewaterfrontcenter.org)"}).json()
-        alerts = [feat["properties"]["event"] for feat in a.get("features", [])
-                  if feat.get("properties", {}).get("event")]
-    except Exception:
-        pass
-
-    wave = m.get("wave_height")
-    sst = m.get("sea_surface_temperature")
-    cur = {
-        **primary,
-        "storm": is_storm(primary["weatherCode"]),
-        "waveFt": wave * 3.281 if wave is not None else None,
-        "sst": sst * 9 / 5 + 32 if sst is not None else None,
-        "source": source,
-    }
-
-    model_winds = {n: round(r["wind"]) for n, r in runs.items() if r and r["wind"] is not None}
-    return cur, alerts, assess_agreement(model_winds)
-
-
-# ----------------------------------------------------------------------------
-# Decision engine (mirrors dashboard evalActivity)
-# ----------------------------------------------------------------------------
-def evaluate(activity, cur, alert_stop, thresholds=None, alert_caution=False):
-    reasons, level = [], "GO"
-    th = thresholds or THRESHOLDS
-
-    def bump(lvl, reason):
-        nonlocal level
-        reasons.append((lvl, reason))
-        if ORDER[lvl] > ORDER[level]:
-            level = lvl
-
-    s = th["shared"]
-    if cur["storm"]:
-        bump("STOP", "Thunderstorm overhead — clear the water")
-    if alert_stop:
-        bump("STOP", "Active NWS marine/storm warning")
-    if alert_caution:
-        bump("CAUTION", "Severe thunderstorm watch/warning in effect — monitor radar closely")
-    if cur["precip"] is not None and cur["precip"] >= s["rainStop"]:
-        bump("STOP", f"Heavy rain ({cur['precip']:.2f} in/hr)")
-    elif cur["precip"] is not None and cur["precip"] >= s["rainCaution"]:
-        bump("CAUTION", f"Rain ({cur['precip']:.2f} in/hr)")
-    if cur["visMi"] is not None and cur["visMi"] < s["visStopMi"]:
-        bump("STOP", f"Low visibility ({cur['visMi']:.1f} mi)")
-    if cur["cape"] is not None and cur["cape"] >= s["capeWatch"]:
-        bump("CAUTION", f"Unstable air (CAPE {round(cur['cape'])}) — storms possible")
-
-    t = th[activity]
-    if activity == "paddle" and in_arc(cur["dir"], th["offshoreArc"]["from"], th["offshoreArc"]["to"]):
-        if cur["wind"] is not None and cur["wind"] >= t["offWindStop"]:
-            bump("STOP", f"Offshore wind {round(cur['wind'])} kn — pushes paddlers out")
-        elif cur["wind"] is not None and cur["wind"] >= t["offWindCaution"]:
-            bump("CAUTION", f"Offshore wind {round(cur['wind'])} kn")
-    if cur["wind"] is not None and cur["wind"] >= t["windStop"]:
-        bump("STOP", f"Sustained wind {round(cur['wind'])} kn")
-    elif cur["wind"] is not None and cur["wind"] >= t["windCaution"]:
-        bump("CAUTION", f"Sustained wind {round(cur['wind'])} kn")
-    if cur["gust"] is not None and cur["gust"] >= t["gustStop"]:
-        bump("STOP", f"Gusts {round(cur['gust'])} kn")
-    elif cur["gust"] is not None and cur["gust"] >= t["gustCaution"]:
-        bump("CAUTION", f"Gusts {round(cur['gust'])} kn")
-
-    return level, reasons
-
-
-# ----------------------------------------------------------------------------
-# Notifications
-# ----------------------------------------------------------------------------
 def send_sms(body):
-    sid = os.environ.get("TWILIO_SID")
-    token = os.environ.get("TWILIO_TOKEN")
-    frm = os.environ.get("TWILIO_FROM")
-    to = [x.strip() for x in os.environ.get("ALERT_SMS_TO", "").split(",") if x.strip()]
+    """True sent, False failed, None not configured."""
+    sid, token, frm = (os.environ.get(k) for k in ("TWILIO_SID", "TWILIO_TOKEN", "TWILIO_FROM"))
+    to = _recipients("ALERT_SMS_TO")
     if not (sid and token and frm and to):
-        print("SMS not configured, skipping.")
-        return
+        return None
     try:
         from twilio.rest import Client
         client = Client(sid, token)
-        for num in to:
-            client.messages.create(body=body, from_=frm, to=num)
-            print(f"SMS sent to {num}")
     except Exception as e:
-        print(f"SMS send failed (continuing): {e}")
+        log(f"SMS setup failed: {e}")
+        return False
+    ok = 0
+    for num in to:
+        try:
+            client.messages.create(body=body[:1500], from_=frm, to=num)
+            ok += 1
+        except Exception as e:
+            log(f"SMS to {num} failed: {e}")
+    log(f"SMS sent to {ok} of {len(to)} number(s)")
+    # Any number reached counts as delivered, so a retry never re-texts the
+    # people who already got it.
+    return ok > 0
 
 
-LEVEL_HTML = {
-    "GO":      ("#2fa36b", "GO"),
-    "CAUTION": ("#b87400", "CAUTION"),
-    "STOP":    ("#c62828", "HALT"),
-}
+def send_email(subject, text_body, html_body=None, image_png=None):
+    """True sent, False failed after retry, None not configured."""
+    host, user, pw = (os.environ.get(k) for k in ("SMTP_HOST", "SMTP_USER", "SMTP_PASS"))
+    try:
+        port = int(os.environ.get("SMTP_PORT") or 587)
+    except ValueError:
+        log(f"SMTP_PORT secret is not a number ({os.environ.get('SMTP_PORT')!r}); using 587")
+        port = 587
+    frm = os.environ.get("EMAIL_FROM") or user
+    to = _recipients("EMAIL_TO")
+    if not (host and user and pw and to):
+        log("Email not configured, skipping.")
+        return None
+
+    if html_body:
+        msg = MIMEMultipart("related")
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(text_body, "plain", "utf-8"))
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
+        msg.attach(alt)
+        if image_png:
+            img = MIMEImage(image_png, _subtype="png")
+            img.add_header("Content-ID", "<conditions>")
+            img.add_header("Content-Disposition", "inline", filename="conditions.png")
+            msg.attach(img)
+    else:
+        msg = MIMEText(text_body, "plain", "utf-8")
+    msg["Subject"], msg["From"], msg["To"] = subject, frm, ", ".join(to)
+
+    for attempt in range(1, SEND_ATTEMPTS + 1):
+        try:
+            if port == 465:
+                server = smtplib.SMTP_SSL(host, port, timeout=30)
+            else:
+                server = smtplib.SMTP(host, port, timeout=30)
+                server.starttls()
+            with server:
+                server.login(user, pw)
+                server.sendmail(frm, to, msg.as_string())
+            log(f"Email sent: {subject}")
+            return True
+        except Exception as e:
+            log(f"Email attempt {attempt} failed: {e}")
+            if attempt < SEND_ATTEMPTS:
+                time.sleep(RETRY_DELAY_S)
+    return False
+
+
+def deliver(subject, sms_body, text_body, html_body=None, image_png=None):
+    """Send on every configured channel. True if ANY channel delivered,
+    False if channels are configured but all failed, None if none configured."""
+    if DRY_RUN:
+        log(f"[DRY RUN] would send: {subject}\n{text_body}\n[DRY RUN] end of message")
+        return True
+    results = [send_sms(sms_body), send_email(subject, text_body, html_body, image_png)]
+    if any(r is True for r in results):
+        return True
+    if any(r is False for r in results):
+        return False
+    log("!!! No alert channel configured — nothing was sent.")
+    return None
+
+
+LEVEL_HTML = {"GO": "#2fa36b", "CAUTION": "#b87400", "STOP": "#c62828"}
+
+
+def esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def fleet_table_html(rows):
-    """Fleet status as a real HTML table — always readable even when the
-    reader's mail client blocks images. This is the safety net, not decoration."""
-    out = ['<table cellpadding="0" cellspacing="0" border="0" '
-           'style="border-collapse:collapse;width:100%;max-width:460px;'
-           'font-family:Arial,Helvetica,sans-serif;font-size:14px;margin:8px 0 4px">']
-    out.append('<tr><th align="left" style="padding:6px 8px;border-bottom:2px solid #ccc;'
-               'font-size:11px;letter-spacing:.08em;color:#666">FLEET</th>'
-               '<th align="right" style="padding:6px 8px;border-bottom:2px solid #ccc;'
-               'font-size:11px;letter-spacing:.08em;color:#666">STATUS</th></tr>')
+    """Fleet status as a real table — readable even when images are blocked."""
+    out = ['<table cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;'
+           'width:100%;max-width:460px;font-family:Arial,Helvetica,sans-serif;font-size:14px;'
+           'margin:8px 0 4px"><tr>'
+           '<th align="left" style="padding:6px 8px;border-bottom:2px solid #ccc;font-size:11px;'
+           'letter-spacing:.08em;color:#666">FLEET</th>'
+           '<th align="right" style="padding:6px 8px;border-bottom:2px solid #ccc;font-size:11px;'
+           'letter-spacing:.08em;color:#666">STATUS</th></tr>']
     for label, lvl, why in rows:
-        color, word = LEVEL_HTML[lvl]
-        note = (f'<span style="color:#777;font-size:12px"> — {why}</span>') if why else ""
-        out.append(
-            f'<tr><td style="padding:7px 8px;border-bottom:1px solid #eee">'
-            f'<span style="display:inline-block;width:4px;height:13px;background:{color};'
-            f'vertical-align:-2px;margin-right:8px"></span>{label}{note}</td>'
-            f'<td align="right" style="padding:7px 8px;border-bottom:1px solid #eee;'
-            f'color:{color};font-weight:bold">{word}</td></tr>')
+        color = LEVEL_HTML[lvl]
+        note = f'<span style="color:#777;font-size:12px"> — {esc(why)}</span>' if why else ""
+        out.append(f'<tr><td style="padding:7px 8px;border-bottom:1px solid #eee">'
+                   f'<span style="display:inline-block;width:4px;height:13px;background:{color};'
+                   f'vertical-align:-2px;margin-right:8px"></span>{esc(label)}{note}</td>'
+                   f'<td align="right" style="padding:7px 8px;border-bottom:1px solid #eee;'
+                   f'color:{color};font-weight:bold">{LEVEL_WORD[lvl]}</td></tr>')
     out.append("</table>")
     return "".join(out)
 
 
 def fleet_table_text(rows):
-    """Plain-text fleet list for the non-HTML part of the message."""
-    lines = []
-    for label, lvl, why in rows:
-        word = LEVEL_HTML[lvl][1]
-        lines.append(f"  {label:<16} {word}" + (f"  ({why})" if why else ""))
-    return "\n".join(lines)
+    return "\n".join(f"  {label:<16} {LEVEL_WORD[lvl]}" + (f"  ({why})" if why else "")
+                     for label, lvl, why in rows)
 
 
-def send_email(subject, body, html_body=None, image_png=None):
-    """Send the alert. If html_body is given the message is multipart:
-    plain text for clients that want it, HTML with the inline graphic for the
-    rest. The graphic is referenced as cid:conditions."""
-    host = os.environ.get("SMTP_HOST")
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    user = os.environ.get("SMTP_USER")
-    pw = os.environ.get("SMTP_PASS")
-    frm = os.environ.get("EMAIL_FROM", user)
-    to = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
-    if not (host and user and pw and to):
-        print("Email not configured, skipping.")
-        return
-
-    if html_body:
-        outer = MIMEMultipart("related")
-        alt = MIMEMultipart("alternative")
-        alt.attach(MIMEText(body, "plain", "utf-8"))
-        alt.attach(MIMEText(html_body, "html", "utf-8"))
-        outer.attach(alt)
-        if image_png:
-            img = MIMEImage(image_png, _subtype="png")
-            img.add_header("Content-ID", "<conditions>")
-            img.add_header("Content-Disposition", "inline",
-                           filename="wfc-conditions.png")
-            outer.attach(img)
-        msg = outer
-    else:
-        msg = MIMEText(body, "plain", "utf-8")
-
-    msg["Subject"] = subject
-    msg["From"] = frm
-    msg["To"] = ", ".join(to)
-    try:
-        with smtplib.SMTP(host, port) as server:
-            server.starttls()
-            server.login(user, pw)
-            server.sendmail(frm, to, msg.as_string())
-        print(f"Email sent to {', '.join(to)}")
-    except Exception as e:
-        print(f"Email send failed (continuing): {e}")
+DISCLAIMER = ("Forecast and observation based. Confirm lightning by eye and ear and apply "
+              "the 30-30 rule. This assists the call; it does not make it.")
 
 
-def build_alert_html(lead, rlist, fleet_rows, cur, obs, src, agreement,
-                     alerts, has_image):
-    """HTML body for an alert email."""
-    esc = lambda s: (str(s).replace("&", "&amp;").replace("<", "&lt;")
-                     .replace(">", "&gt;"))
-    parts = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;'
-             'color:#222;line-height:1.5;max-width:620px">']
-    parts.append(f'<p style="margin:0 0 10px"><b>{esc(lead)}</b></p>')
-    if rlist:
-        parts.append('<ul style="margin:0 0 12px;padding-left:20px">' +
-                     "".join(f"<li>{esc(r)}</li>" for r in rlist) + "</ul>")
+def build_message(lead, reasons, ctx, has_image):
+    """(text_body, html_body) for an alert or all-clear."""
+    details = [f"Forecast: {ctx['cond_line']}", ctx["obs_line"],
+               f"Primary model: {ctx['source'] or 'none'}", ctx["agreement_line"]]
+    if ctx["nws_names"]:
+        details.append(f"NWS alerts: {', '.join(ctx['nws_names'])}")
+
+    text = lead
+    if reasons:
+        text += "\n\nReasons:\n" + "\n".join(f"  • {r}" for r in reasons)
+    if ctx["fleet_rows"]:
+        text += "\n\nFleet:\n" + fleet_table_text(ctx["fleet_rows"])
+    if ctx["gaps"]:
+        text += "\n\nData gaps:\n" + "\n".join(f"  ! {g}" for g in ctx["gaps"])
+    text += "\n\n" + "\n".join(details) + "\n\n" + DISCLAIMER
+
+    h = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;color:#222;'
+         'line-height:1.5;max-width:620px">', f'<p style="margin:0 0 10px"><b>{esc(lead)}</b></p>']
+    if reasons:
+        h.append('<ul style="margin:0 0 12px;padding-left:20px">' +
+                 "".join(f"<li>{esc(r)}</li>" for r in reasons) + "</ul>")
     if has_image:
-        parts.append('<img src="cid:conditions" width="720" '
-                     'alt="Wind compass and fleet status" '
-                     'style="width:100%;max-width:720px;height:auto;'
-                     'border:1px solid #ddd;border-radius:6px;margin:6px 0 2px">')
-    if fleet_rows:
-        parts.append(fleet_table_html(fleet_rows))
-    parts.append('<p style="margin:14px 0 4px;font-size:13px;color:#555">'
-                 f'<b>Forecast:</b> {esc(conditions_line(cur))}<br>'
-                 f'{esc(obs_line(obs))}<br>'
-                 f'Primary model: {esc(src)}<br>'
-                 f'{esc(agreement_line(agreement))}')
-    if alerts:
-        parts.append(f'<br>NWS alerts: {esc(", ".join(sorted(set(alerts))))}')
-    parts.append('</p>')
-    parts.append('<p style="margin:12px 0 0;font-size:12px;color:#777;'
-                 'border-top:1px solid #eee;padding-top:8px">'
-                 'Forecast and observation based. Confirm lightning by eye and ear '
-                 'and apply the 30-30 rule. This assists the call; it does not make it.</p>')
-    parts.append('</div>')
-    return "".join(parts)
+        h.append('<img src="cid:conditions" width="720" alt="Wind compass and fleet status" '
+                 'style="width:100%;max-width:720px;height:auto;border:1px solid #ddd;'
+                 'border-radius:6px;margin:6px 0 2px">')
+    if ctx["fleet_rows"]:
+        h.append(fleet_table_html(ctx["fleet_rows"]))
+    if ctx["gaps"]:
+        h.append('<p style="margin:12px 0 4px;padding:8px 10px;background:#fff4e5;'
+                 'border-left:4px solid #b87400;font-size:13px"><b>Data gaps:</b><br>' +
+                 "<br>".join(esc(g) for g in ctx["gaps"]) + "</p>")
+    h.append('<p style="margin:14px 0 4px;font-size:13px;color:#555">' +
+             "<br>".join(esc(d) for d in details) + "</p>")
+    h.append('<p style="margin:12px 0 0;font-size:12px;color:#777;border-top:1px solid #eee;'
+             f'padding-top:8px">{esc(DISCLAIMER)}</p></div>')
+    return text, "".join(h)
 
 
-def conditions_line(cur):
-    return (f"Wind {round(cur['wind'])} kn {compass(cur['dir'])}, "
-            f"gusts {round(cur['gust'])} kn, "
-            f"{wx_text(cur['weatherCode'])}, "
-            f"rain {cur['precip']:.2f} in/hr"
-            + (f", waves {cur['waveFt']:.1f} ft" if cur['waveFt'] is not None else ""))
+# ============================================================================
+# State
+# ============================================================================
+def blank_state():
+    return {"version": STATE_VERSION,
+            "activities": {a.id: {"level": "GO", "below_runs": 0, "below_peak": "GO"}
+                           for a in SITE.activities},
+            "health": {"forecast": 0, "observation": 0, "nws": 0, "degraded_notified": False}}
 
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
+def _count(v) -> int:
+    """A non-negative whole number from state.json, or 0 if it's anything else."""
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+
 def load_state():
+    """Read state.json, upgrading the original {"paddle": "GO", ...} format.
+    A missing or corrupt file starts from all-GO rather than crashing."""
+    st = blank_state()
     try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {"paddle": "GO", "sail": "GO"}
+        raw = json.loads(STATE_FILE.read_text())
+    except FileNotFoundError:
+        return st
+    except Exception as e:
+        log(f"state.json unreadable ({e}); starting fresh")
+        return st
+    if not isinstance(raw, dict):
+        return st
+    if "activities" in raw:                                   # v2
+        acts = raw.get("activities")
+        for aid, rec in (acts.items() if isinstance(acts, dict) else ()):
+            if aid in st["activities"] and isinstance(rec, dict) and rec.get("level") in ORDER:
+                st["activities"][aid] = {
+                    "level": rec["level"],
+                    "below_runs": _count(rec.get("below_runs")),
+                    "below_peak": rec["below_peak"] if rec.get("below_peak") in ORDER else "GO"}
+        health = raw.get("health")
+        for k, v in (health.items() if isinstance(health, dict) else ()):
+            if k == "degraded_notified":
+                st["health"][k] = v is True
+            elif k in st["health"]:
+                st["health"][k] = _count(v)
+    else:                                                     # v1: {"paddle": "GO"}
+        for aid, lvl in raw.items():
+            if aid in st["activities"] and lvl in ORDER:
+                st["activities"][aid]["level"] = lvl
+    return st
 
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+def save_state(st):
+    """Write atomically so a cancelled run can't leave half a file."""
+    if DRY_RUN:
+        log("[DRY RUN] state.json not changed")
+        return
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=2) + "\n")
+    os.replace(tmp, STATE_FILE)
+
+
+# ============================================================================
+# Health: tell a human when the monitor itself can't be trusted
+# ============================================================================
+HEALTH_PARTS = {"forecast": "forecast models", "observation": "every live station",
+                "nws": "NWS alerts"}
+
+
+def update_health(st, ok: dict, ts: str):
+    h = st["health"]
+    for part, good in ok.items():
+        h[part] = 0 if good else h.get(part, 0) + 1
+    n = SITE.health_alert_after_runs
+    down = [HEALTH_PARTS[p] for p in HEALTH_PARTS if h.get(p, 0) >= n]
+    tag = SITE.short_name
+    if down and not h["degraded_notified"]:
+        what = ", ".join(down)
+        body = (f"The {tag} weather monitor has been unable to reach {what} for {n}+ "
+                f"consecutive runs (as of {ts}).\n\nAlerts are still running on whatever data "
+                f"remains, but treat the monitor as unreliable until you get the all-clear "
+                f"email. Make the call by eye.")
+        if deliver(f"⚠️ {tag} monitor degraded — {what} down",
+                   f"⚠️ {tag} monitor degraded: {what} down. Make the call by eye. ({ts})",
+                   body):
+            h["degraded_notified"] = True
+    elif not down and h["degraded_notified"]:
+        if deliver(f"✅ {tag} monitor back to normal",
+                   f"✅ {tag} monitor back to normal ({ts})",
+                   f"All weather data sources are reporting again as of {ts}."):
+            h["degraded_notified"] = False
+    return down
+
+
+def ping_healthcheck(fail: bool, summary: str):
+    """Dead-man's switch: ping HEALTHCHECK_URL (e.g. healthchecks.io) every run.
+    If the pings stop — cron-job.org down, token expired, Actions broken —
+    the service emails you. Never lets a ping problem break the run."""
+    url = os.environ.get("HEALTHCHECK_URL")
+    if not url or DRY_RUN:
+        return
+    try:
+        HTTP.post(url.rstrip("/") + ("/fail" if fail else ""), data=summary[:9000].encode(),
+                  timeout=10)
+    except Exception as e:
+        log(f"healthcheck ping failed (ignored): {e}")
+
+
+# ============================================================================
+# Main
+# ============================================================================
+def run() -> dict:
+    """One monitor cycle. Returns a summary dict (used by tests and the log)."""
+    now = now_local()
+    ts = now.strftime("%-I:%M %p")
+    st = load_state()
+
+    if not in_operating_hours(SITE, now.hour) and not DRY_RUN:   # dry runs check any time
+        # Closed: reset to GO so a bad morning triggers a fresh alert at opening.
+        for rec in st["activities"].values():
+            rec.update(level="GO", below_runs=0, below_peak="GO")
+        save_state(st)
+        log(f"Outside operating hours ({now:%H:%M}); state reset, no checks.")
+        return {"open": False, "sent": [], "degraded": []}
+
+    fc = fetch_forecast()
+    obs, skipped = fetch_observation()
+    nws = fetch_nws()
+    marine = fetch_marine() if fc["primary"] else {}
+
+    p = fc["primary"] or {}
+    cond = Conditions(wind_kn=p.get("wind"), gust_kn=p.get("gust"), dir_deg=p.get("dir"),
+                      precip_in_hr=p.get("precip_in_hr"), vis_mi=p.get("vis_mi"),
+                      cape=p.get("cape"), storm=p.get("weather_code") in (95, 96, 99))
+    snap = assess(SITE, cond, obs, nws["names"], now, forecast_source=fc["source"],
+                  agreement=fc["agreement"])
+    gaps = data_gap_notes(fc, obs, skipped, nws)
+    snap["data_gaps"] = gaps
+
+    ctx = {"cond_line": conditions_line(fc["primary"], marine), "obs_line": obs_line(obs),
+           "source": fc["source"], "agreement_line": agreement_line(fc["agreement"]),
+           "nws_names": nws["names"], "gaps": gaps,
+           "fleet_rows": [(f["label"], f["level"], f["reason"]) for f in snap["fleet"]]}
+    log(f"Primary model: {fc['source']} | {ctx['agreement_line']}")
+    log(ctx["obs_line"])
+    for g in gaps:
+        log(f"DATA GAP: {g}")
+
+    graphic = None
+    if render_conditions_png and (obs is not None or cond.wind_kn is not None):
+        try:
+            if obs is not None:
+                gw, gg, gd, gs = obs.wind_kn, obs.gust_kn, obs.dir_deg, obs.station
+            else:
+                gw, gg, gd = cond.wind_kn, cond.gust_kn, cond.dir_deg
+                gs = f"{fc['source']} forecast (no station reporting)"
+            graphic = render_conditions_png(
+                gw, gg, gd, gs, ctx["fleet_rows"],
+                arcs=[(a.start, a.end) for a in SITE.offshore_arcs],
+                headline=f"{SITE.area_name} conditions")
+        except Exception as e:
+            log(f"graphic render failed (continuing without it): {e}")
+
+    sent = []
+    have_wind = obs is not None or cond.wind_kn is not None
+    if not have_wind:
+        log("!!! No wind data from any source — holding the last call, no changes sent.")
+    else:
+        # Stepping DOWN needs a complete picture: if the forecast (storm, rain,
+        # visibility) or any NWS query failed, a HALT for one of those reasons
+        # can't be confirmed gone, so hold instead of counting toward a clear.
+        checks_complete = fc["primary"] is not None and nws["ok"]
+        if not checks_complete:
+            log("Checks incomplete this run — no step-down or all-clear allowed.")
+        for act in snap["activities"]:
+            rec = st["activities"][act["id"]]
+            new_rec, action = advance(rec, act["level"], SITE, can_step_down=checks_complete)
+            if action is None:
+                log(f"{act['label']}: {rec['level']} -> {act['level']} "
+                    f"(stored {new_rec['level']}, no notice)")
+                st["activities"][act["id"]] = new_rec
+                continue
+            result = notify(action, act, rec["level"], new_rec["level"], ctx, ts, graphic)
+            if result is False:
+                log(f"!!! {act['label']}: notice failed to send — will retry next run")
+                continue                                # keep old record => retry
+            st["activities"][act["id"]] = new_rec
+            sent.append((act["id"], action, new_rec["level"]))
+            save_state(st)          # record it now, so a later crash can't re-send it
+
+    down = update_health(st, {"forecast": fc["primary"] is not None,
+                              "observation": obs is not None, "nws": nws["ok"]}, ts)
+    save_state(st)
+    try:
+        STATUS_FILE.write_text(json.dumps(snap, indent=2) + "\n")
+    except Exception as e:
+        log(f"status.json write failed (ignored): {e}")
+    if DRY_RUN:
+        log("[DRY RUN] calls: " + ", ".join(f"{a['label']} {a['word']}" for a in snap["activities"])
+            + " | fleet: " + ", ".join(f"{f['label']} {f['word']}" for f in snap["fleet"]))
+    return {"open": True, "sent": sent, "degraded": down, "gaps": gaps, "snapshot": snap}
+
+
+def notify(action, act, was, level, ctx, ts, graphic):
+    label = act["label"]
+    tag = SITE.short_name
+    if action == "ease":
+        subject = f"🟡 {tag} CAUTION — {label} (eased from HALT)"
+        lead = (f"{label} at {SITE.area_name} eased from HALT to CAUTION as of {ts}. "
+                f"Conditions are still near limits — not an all-clear.")
+        reasons = act["headline_reasons"]
+        sms = f"{subject}. ({ts}) {ctx['cond_line']}"
+    elif action == "alert":
+        if level == "STOP":
+            subject = f"⚠️ {tag} HALT — {label}"
+            lead = f"Halt {label} at {SITE.area_name} as of {ts}."
+        else:
+            subject = f"🟡 {tag} CAUTION — {label}"
+            lead = (f"Use caution for {label} at {SITE.area_name} as of {ts} — conditions are "
+                    f"approaching limits.")
+        reasons = act["headline_reasons"]
+        sms = (f"{subject}. {'; '.join(reasons[:3])}. ({ts}) {ctx['cond_line']}"
+               + (" [DATA GAPS]" if ctx["gaps"] else ""))
+    else:
+        subject = f"✅ {tag} CLEAR — {label}"
+        lead = f"{label} cleared to operate as of {ts}."
+        reasons = []
+        sms = f"{subject} OK. ({ts}) {ctx['cond_line']}"
+    text, html = build_message(lead, reasons, ctx, graphic is not None)
+    log(f"{action.upper()}: {label} {was} -> {level}")
+    return deliver(subject, sms, text, html, graphic)
 
 
 def main():
-    now = datetime.now(TZ)
-    # Outside operating hours: reset to baseline so a bad morning triggers a fresh alert.
-    if not (OPEN_HOUR <= now.hour < CLOSE_HOUR):
-        save_state({"paddle": "GO", "sail": "GO"})
-        print(f"Outside operating hours ({now:%H:%M}); state reset, no alerts.")
-        return
-
-    cur, alerts, agreement = fetch_conditions()
-    obs = fetch_observations()
-    # NWS alert routing: thunderstorm watches/warnings -> CAUTION (your eyes + radar
-    # make the call); the rest remain hard HALTs. A storm actually overhead
-    # (weather code / observation) still forces HALT separately.
-    stop_events = ("Tornado", "Special Marine", "Marine Warning",
-                   "Hurricane", "Tropical Storm", "Gale", "Storm Warning")
-    caution_events = ("Thunderstorm",)
-    alert_stop = any(any(k in a for k in stop_events) for a in alerts)
-    alert_caution = (not alert_stop and
-                     any(any(k in a for k in caution_events) for a in alerts))
-    src = SRC_LABEL.get(cur.get("source"), cur.get("source"))
-    print(f"Primary model: {src} | {agreement_line(agreement)}")
-    print(obs_line(obs))
-
-    prev = load_state()
-    new_state = {}
-    ts = now.strftime("%-I:%M %p")
-
-    # ---- conditions graphic + per-asset fleet status -----------------------
-    # Prefer MEASURED wind for the graphic; fall back to the forecast if no
-    # station is reporting, so the picture always reflects the best data we have.
-    if obs:
-        g_wind, g_gust, g_dir = obs["wind"], obs["gust"], obs["dir"]
-        g_station = obs["station"]
-    else:
-        g_wind, g_gust, g_dir = cur["wind"], cur["gust"], cur["dir"]
-        g_station = f"{src} forecast (no station reporting)"
-    # Lightning or a hard NWS warning halts the entire fleet regardless of wind.
-    force_stop = None
-    if cur["storm"]:
-        force_stop = "thunderstorm overhead"
-    elif alert_stop:
-        force_stop = "NWS marine/storm warning"
-
-    fleet_rows, graphic = None, None
-    if fleet_status:
-        try:
-            fleet_rows = fleet_status(g_wind, g_gust, g_dir, force_stop)
-        except Exception as e:
-            print(f"fleet status failed (continuing): {e}")
-    if render_conditions_png:
-        try:
-            graphic = render_conditions_png(g_wind, g_gust, g_dir, g_station,
-                                            force_stop_reason=force_stop)
-        except Exception as e:
-            print(f"graphic render failed (continuing): {e}")
-
-    def is_alert(lvl):
-        return lvl == "STOP" or (ALERT_ON_CAUTION and lvl == "CAUTION")
-
-    for act in ("paddle", "sail"):
-        f_level, f_reasons = evaluate(act, cur, alert_stop, alert_caution=alert_caution)
-        o_level, o_reasons = evaluate_observed(act, obs)
-        # Worst case wins: a measured exceedance forces the alert even if models say calm
-        level = f_level if ORDER[f_level] >= ORDER[o_level] else o_level
-        reasons = f_reasons + o_reasons
-        new_state[act] = level
-        was, name = prev.get(act, "GO"), LABELS[act]
-        # reasons at the current (top) severity, so a CAUTION note lists caution reasons
-        rlist = [r for l, r in reasons if ORDER[l] == ORDER[level]] or [r for _, r in reasons]
-
-        # Notify when entering an alert level OR escalating to a higher one
-        # (GO->CAUTION, GO->STOP, CAUTION->STOP). All-clear when fully back to GO.
-        if is_alert(level) and (not is_alert(was) or ORDER[level] > ORDER[was]):
-            if level == "STOP":
-                tag, lead = "⚠️ WFC HALT", f"Halt {name} at West Harbor as of {ts}."
-            else:
-                tag, lead = "🟡 WFC CAUTION", (f"Use caution for {name} at West Harbor as of {ts} "
-                                              "— conditions are approaching limits.")
-            why = "; ".join(rlist[:3])
-            conf = agreement["level"]
-            send_sms(f"{tag} — {name}. {why}. ({ts}) {conditions_line(cur)} [{conf} conf]")
-            text_body = (
-                f"{lead}\n\nReasons:\n" + "\n".join(f"  • {r}" for r in rlist) +
-                (("\n\nFleet:\n" + fleet_table_text(fleet_rows)) if fleet_rows else "") +
-                f"\n\nForecast: {conditions_line(cur)}\n"
-                f"{obs_line(obs)}\n"
-                f"Primary model: {src}\n"
-                f"{agreement_line(agreement)}\n"
-                + (f"NWS alerts: {', '.join(sorted(set(alerts)))}\n" if alerts else "")
-                + "\nThis is forecast/observation-based. Confirm lightning by eye/ear (30-30 rule)."
-            )
-            send_email(
-                f"{tag} — {name}",
-                text_body,
-                html_body=build_alert_html(lead, rlist, fleet_rows, cur, obs,
-                                           src, agreement, alerts,
-                                           has_image=graphic is not None),
-                image_png=graphic,
-            )
-            print(f"ALERT: {name} {was} -> {level}")
-        # transition back to fully clear
-        elif not is_alert(level) and is_alert(was):
-            send_sms(f"✅ WFC CLEAR — {name} OK. ({ts}) {conditions_line(cur)}")
-            clear_lead = f"{name} cleared to operate as of {ts}."
-            send_email(
-                f"✅ WFC CLEAR — {name}",
-                clear_lead +
-                (("\n\nFleet:\n" + fleet_table_text(fleet_rows)) if fleet_rows else "") +
-                f"\n\nConditions: {conditions_line(cur)}\n{obs_line(obs)}",
-                html_body=build_alert_html(clear_lead, [], fleet_rows, cur, obs,
-                                           src, agreement, alerts,
-                                           has_image=graphic is not None),
-                image_png=graphic,
-            )
-            print(f"ALL CLEAR: {name} {was} -> {level}")
-        else:
-            print(f"{name}: {was} -> {level} (no change in alert state)")
-
-    save_state(new_state)
+    try:
+        summary = run()
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        ping_healthcheck(True, tb)
+        sys.exit(1)
+    ping_healthcheck(bool(summary.get("degraded")),
+                     json.dumps({k: summary.get(k) for k in ("open", "sent", "degraded", "gaps")}))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
