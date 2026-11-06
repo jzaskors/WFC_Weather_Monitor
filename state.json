@@ -1,4 +1,21 @@
 {
-  "paddle": "GO",
-  "sail": "GO"
+  "version": 2,
+  "activities": {
+    "paddle": {
+      "level": "GO",
+      "below_runs": 0,
+      "below_peak": "GO"
+    },
+    "sail": {
+      "level": "GO",
+      "below_runs": 0,
+      "below_peak": "GO"
+    }
+  },
+  "health": {
+    "forecast": 0,
+    "observation": 0,
+    "nws": 0,
+    "degraded_notified": false
+  }
 }
