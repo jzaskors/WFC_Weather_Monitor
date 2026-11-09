@@ -7,7 +7,7 @@
       "below_peak": "GO"
     },
     "sail": {
-      "level": "CAUTION",
+      "level": "STOP",
       "below_runs": 0,
       "below_peak": "GO"
     }
