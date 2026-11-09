@@ -2,7 +2,7 @@
   "version": 2,
   "activities": {
     "paddle": {
-      "level": "CAUTION",
+      "level": "GO",
       "below_runs": 0,
       "below_peak": "GO"
     },
