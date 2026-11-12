@@ -19,7 +19,9 @@
     "rain_caution_in_hr": 0.10,
     "rain_stop_in_hr": 0.30,
     "cape_watch": 1000,
-    "visibility_stop_mi": 0.5
+    "visibility_stop_mi": 0.5,
+    "lightning_stop_mi": 3,
+    "lightning_hold_min": 30
   },
 
   "nws_marine_zones": ["ANZ335"],
@@ -58,6 +60,7 @@
   "observation_sources": [
     { "id": "wfc_tempest", "type": "tempest", "label": "WFC dock (Tempest)",
       "station_id": 238215, "auth": "token",
+      "lightning": true, "device_id": 1264385,
       "exposure_offset_kn": 0, "max_age_min": 15, "has_live_gust": true,
       "enabled": true,
       "note": "Re-mounted outside Nov 7, 2026; the re-setup moved it from old station 61040 to 238215. If it is ever taken down or brought indoors, set enabled to false — indoors it reads calm, which would read as an all-clear." },
@@ -73,16 +76,57 @@
       "embed_id": "e9aef99860fc4aecb73f08d0d9cb3e37",
       "exposure_offset_kn": 0, "max_age_min": 20, "has_live_gust": false,
       "note": "Backup route to Sagamore that needs no key. No live gust on this feed." },
-    { "id": "bayville_30", "type": "wunderground", "label": "Bayville (KNYOYSTE30)",
-      "station": "KNYOYSTE30",
+    { "id": "ferry_beach", "type": "wunderground", "label": "Ferry Beach, Bayville",
+      "station": "KNYBAYVI15",
+      "exposure_offset_kn": 0, "max_age_min": 20, "has_live_gust": true,
+      "enabled": false,
+      "note": "Candidate only. North end of West Harbor by the Bayville bridge, about 2.4 mi NNW of the dock. Compare it in the station check before switching on." },
+    { "id": "bayville_46", "type": "wunderground", "label": "Bayville Station (Sound side)",
+      "station": "KNYBAYVI46",
       "exposure_offset_kn": 2, "max_age_min": 20, "has_live_gust": true,
       "enabled": false,
-      "note": "Candidate only. Shown in the station check; switch on after comparing it with the harbor stations." },
+      "note": "Candidate only. West Bayville near the Sound, about 2.7 mi NW of the dock; expect it to read windier than the harbor." },
     { "id": "44040", "type": "ndbc", "label": "WLIS buoy (5 nm N)",
       "station": "44040", "exposure_offset_kn": 2, "max_age_min": 90, "has_live_gust": true },
     { "id": "kptn6", "type": "ndbc", "label": "Kings Point (11 mi WSW)",
       "station": "KPTN6", "exposure_offset_kn": 2, "max_age_min": 90, "has_live_gust": true }
   ],
+
+  "briefing": {
+    "wind_kn": 22,
+    "min_hours": 3,
+    "horizon_hours": 72,
+    "agree_fraction": 0.6,
+    "min_models": 2,
+    "check_hours": [6, 15],
+    "lead_hours": 6,
+    "wave_flag_ft": 2.0,
+    "models": [
+      { "name": "HRRR",  "id": "ncep_hrrr_conus" },
+      { "name": "NAM",   "id": "ncep_nam_conus" },
+      { "name": "GFS",   "id": "gfs_seamless" },
+      { "name": "ECMWF", "id": "ecmwf_ifs025" },
+      { "name": "AIFS",  "id": "ecmwf_aifs025_single" },
+      { "name": "ICON",  "id": "icon_seamless" },
+      { "name": "NBM",   "id": "ncep_nbm_conus" }
+    ],
+    "fetch_nm_note": "Open water from the docks, nautical miles, by the direction the wind comes FROM. Estimates: correct from local knowledge.",
+    "fetch_nm": { "N": 1.6, "NNE": 1.2, "NE": 1.5, "ENE": 2.5, "E": 1.2, "ESE": 0.5,
+                  "SE": 0.2, "SSE": 0.2, "S": 0.1, "SSW": 0.1, "SW": 0.1, "WSW": 0.1,
+                  "W": 0.2, "WNW": 0.3, "NW": 0.5, "NNW": 0.9 },
+    "assets": [
+      { "label": "Sonars and the mooring field", "when": { "wind_kn": 22 },
+        "action": "Check every pennant and its chafe gear. Add a second pennant where you can." },
+      { "label": "Dinghies and cats on the storage floats", "when": { "gust_kn": 25 },
+        "action": "Lower masts or lash hulls flat to the float. Double the tie-downs." },
+      { "label": "Opti, board and kayak racks", "when": { "gust_kn": 30 },
+        "action": "Strap every rack. Bring loose boards, tubes and gear ashore." },
+      { "label": "Coach boats and the keelboat alongside", "when": { "wind_kn": 20, "dirs": ["NNW", "N", "NNE", "NE", "ENE", "E"] },
+        "action": "Move off the exposed face of the dock to a mooring or the sheltered side. Double lines and fenders." },
+      { "label": "Floats and gangway", "when": { "wave_ft": 2.0 },
+        "action": "Check pile hoops, hinge pins and gangway rollers. Clear dock boxes and anything loose." }
+    ]
+  },
 
   "forecast_models": [
     { "name": "HRRR", "open_meteo_id": "ncep_hrrr_conus", "label": "HRRR 3 km" },
