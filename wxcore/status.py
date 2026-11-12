@@ -13,8 +13,8 @@ from datetime import datetime
 from typing import Optional
 
 from .config import Site
-from .engine import (Conditions, Observation, LEVEL_WORD, activity_call, classify_nws,
-                     fleet_calls, in_operating_hours, worst)
+from .engine import (Conditions, Observation, Lightning, LEVEL_WORD, activity_call,
+                     classify_nws, fleet_calls, in_operating_hours, lightning_active, worst)
 
 STATUS_VERSION = 1
 
@@ -30,7 +30,9 @@ def _r(v, nd=1):
     return None if v is None else round(v, nd)
 
 
-def force_stop_reason(cond: Conditions, nws_stop: bool) -> Optional[str]:
+def force_stop_reason(cond: Conditions, nws_stop: bool, lightning_near: bool = False) -> Optional[str]:
+    if lightning_near:
+        return "lightning nearby"
     if cond.storm:
         return "thunderstorm overhead"
     if nws_stop:
@@ -40,7 +42,7 @@ def force_stop_reason(cond: Conditions, nws_stop: bool) -> Optional[str]:
 
 def assess(site: Site, cond: Conditions, obs: Optional[Observation], nws_alerts: list,
            now: datetime, forecast_source: Optional[str] = None,
-           agreement: Optional[dict] = None) -> dict:
+           agreement: Optional[dict] = None, lightning: Optional[Lightning] = None) -> dict:
     """Run every rule for the site and return the full snapshot.
 
     now must be timezone-aware in the site's local zone.
@@ -49,7 +51,7 @@ def assess(site: Site, cond: Conditions, obs: Optional[Observation], nws_alerts:
 
     activities = []
     for unit in site.activities:
-        r = activity_call(unit, cond, obs, site, nws_stop, nws_caution)
+        r = activity_call(unit, cond, obs, site, nws_stop, nws_caution, lightning)
         call = r["call"]
         activities.append({
             "id": unit.id,
@@ -68,7 +70,8 @@ def assess(site: Site, cond: Conditions, obs: Optional[Observation], nws_alerts:
         fw, fg, fd, basis = obs.wind_kn, obs.gust_kn, obs.dir_deg, "observed"
     else:
         fw, fg, fd, basis = cond.wind_kn, cond.gust_kn, cond.dir_deg, "forecast"
-    fsr = force_stop_reason(cond, nws_stop)
+    near = lightning_active(lightning, site)
+    fsr = force_stop_reason(cond, nws_stop, near)
     fleet = [{"id": u.id, "label": u.label, "level": lvl, "word": LEVEL_WORD[lvl], "reason": why}
              for u, lvl, why in fleet_calls(site, fw, fg, fd, fsr)]
 
@@ -109,6 +112,11 @@ def assess(site: Site, cond: Conditions, obs: Optional[Observation], nws_alerts:
             "agreement": agreement,
         },
         "nws_alerts": sorted(set(nws_alerts)),
+        "lightning": None if lightning is None else {
+            "halt": near, "distance_mi": _r(lightning.distance_mi),
+            "minutes_ago": round(lightning.minutes_ago), "station": lightning.station,
+            "sensor_offline": lightning.sensor_offline,
+            "stop_mi": site.shared.lightning_stop_mi, "hold_min": site.shared.lightning_hold_min},
         "disclaimer": ("Forecast and observation based. Confirm lightning by eye and ear "
                        "and apply the 30-30 rule. This assists the call; it does not make it."),
     }
