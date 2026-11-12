@@ -3,13 +3,13 @@
   "activities": {
     "paddle": {
       "level": "STOP",
-      "below_runs": 0,
-      "below_peak": "GO"
+      "below_runs": 1,
+      "below_peak": "CAUTION"
     },
     "sail": {
       "level": "STOP",
-      "below_runs": 0,
-      "below_peak": "GO"
+      "below_runs": 1,
+      "below_peak": "CAUTION"
     }
   },
   "health": {
