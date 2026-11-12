@@ -41,6 +41,7 @@ jobs:
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
           TEMPEST_TOKEN:   ${{ secrets.TEMPEST_TOKEN }}
           TEMPEST_API_KEY: ${{ secrets.TEMPEST_API_KEY }}
+          WU_API_KEY:      ${{ secrets.WU_API_KEY }}
         run: python monitor.py
       # Always save state — even if the check step crashed — so a sent alert is
       # never forgotten and re-sent. Retries if another run pushed first.
