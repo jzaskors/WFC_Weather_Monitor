@@ -94,6 +94,9 @@
 
   "briefing": {
     "wind_kn": 22,
+    "gust_kn": 30,
+    "gust_agree_count": 3,
+    "level_note": "A storm = at least min_hours where gust_agree_count models show gusts at gust_kn, or agree_fraction of the models show sustained wind at wind_kn. Models run light on sustained wind at the dock, so gusts are the main route.",
     "min_hours": 3,
     "horizon_hours": 72,
     "agree_fraction": 0.6,
@@ -103,7 +106,6 @@
     "wave_flag_ft": 2.0,
     "models": [
       { "name": "HRRR",  "id": "ncep_hrrr_conus" },
-      { "name": "NAM",   "id": "ncep_nam_conus" },
       { "name": "GFS",   "id": "gfs_seamless" },
       { "name": "ECMWF", "id": "ecmwf_ifs025" },
       { "name": "AIFS",  "id": "ecmwf_aifs025_single" },
