@@ -1,0 +1,25 @@
+name: Tempest check
+# Manual diagnostic: Actions tab -> "Tempest check" -> Run workflow.
+# Fetches every Tempest station in sites/wfc.json (enabled or not) and prints
+# the raw latest observation and how it parses. No email, no state change.
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Confirm the module imports under its exact filename
+        run: python -c "import tempest; print('import OK:', tempest.__file__)"
+      - name: Fetch and parse each Tempest station
+        env:
+          TEMPEST_TOKEN:   ${{ secrets.TEMPEST_TOKEN }}
+          TEMPEST_API_KEY: ${{ secrets.TEMPEST_API_KEY }}
+        run: |
+          targets=$(python -c "import json; s=json.load(open('sites/wfc.json')); print(' '.join(f\"{o['station_id']}:{o.get('auth','public')}\" for o in s['observation_sources'] if o['type']=='tempest' and o.get('station_id')))")
+          echo "Stations: $targets"
+          python tempest.py $targets
