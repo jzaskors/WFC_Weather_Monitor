@@ -81,6 +81,14 @@ except Exception as _e:
           f"The file must be named lowercase 'sagamore.py' — the runner is case-sensitive.")
     fetch_sagamore, SagamoreUnavailable = None, Exception
 
+# WeatherFlow Tempest fetcher (tempest.py, same folder, lowercase name).
+try:
+    from tempest import fetch_tempest, TempestUnavailable
+except Exception as _e:
+    print(f"!!! tempest module unavailable ({_e}); Tempest stations will be skipped. "
+          f"The file must be named lowercase 'tempest.py'.")
+    fetch_tempest, TempestUnavailable = None, Exception
+
 # Conditions graphic (render_conditions.py + Pillow). Optional: alerts still
 # go out as HTML + text without it.
 try:
@@ -315,7 +323,29 @@ def _obs_ndbc(src) -> Observation:
                        exposure_offset_kn=src.exposure_offset_kn)
 
 
-OBS_FETCHERS = {"weatherlink_embed": _obs_weatherlink_embed, "ndbc": _obs_ndbc}
+def _obs_tempest(src) -> Observation:
+    if fetch_tempest is None:
+        raise SourceError("tempest.py not importable")
+    sid = src.params.get("station_id")
+    if not sid:
+        raise SourceError("no station_id set in the site file")
+    try:
+        t = fetch_tempest(sid, auth=src.params.get("auth", "public"), session=HTTP)
+    except TempestUnavailable as e:
+        raise SourceError(str(e))
+    except Exception as e:
+        raise SourceError(f"{type(e).__name__}: {e}")
+    age = (time.time() - t["observed_epoch"]) / 60
+    if age > src.max_age_min:
+        raise SourceError(f"stale ({age:.0f} min old)")
+    return Observation(wind_kn=t["wind_kn"], gust_kn=t["gust_kn"], dir_deg=t["wind_dir_deg"],
+                       station=src.label, age_min=max(age, 0),
+                       exposure_offset_kn=src.exposure_offset_kn,
+                       gust_monitored=t["gust_monitored"])
+
+
+OBS_FETCHERS = {"weatherlink_embed": _obs_weatherlink_embed, "ndbc": _obs_ndbc,
+                "tempest": _obs_tempest}
 
 
 def fetch_observation() -> tuple:
