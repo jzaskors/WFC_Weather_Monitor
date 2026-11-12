@@ -1,0 +1,46 @@
+name: Storm briefing (preview or backtest)
+# Manual: Actions tab -> "Storm briefing (preview or backtest)" -> Run workflow.
+#   Preview (default): emails the 3-day briefing as it stands right now, marked
+#     PREVIEW, whether or not anything is forecast.
+#   Backtest: prints how many storms the rule would have flagged over the past
+#     year at a range of levels. No email.
+# Neither changes anything. The real briefing runs inside "WFC Weather Monitor".
+on:
+  workflow_dispatch:
+    inputs:
+      to:
+        description: "Send to (leave blank for the briefing list)"
+        required: false
+        default: ""
+      backtest:
+        description: "Backtest the past year instead of sending a preview"
+        type: boolean
+        default: false
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt matplotlib
+      - name: Build and email the briefing
+        env:
+          SMTP_HOST:       ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:       ${{ secrets.SMTP_PORT }}
+          SMTP_USER:       ${{ secrets.SMTP_USER }}
+          SMTP_PASS:       ${{ secrets.SMTP_PASS }}
+          EMAIL_FROM:      ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:        ${{ secrets.EMAIL_TO }}
+          BRIEFING_TO:     ${{ inputs.to || secrets.BRIEFING_TO }}
+          EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME }}
+          EMAIL_REPLY_TO:  ${{ secrets.EMAIL_REPLY_TO }}
+        run: |
+          if [ "${{ inputs.backtest }}" = "true" ]; then
+            python briefing.py --backtest
+          else
+            python briefing.py --preview
+          fi
