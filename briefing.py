@@ -13,7 +13,9 @@ How it decides
     "briefing" in sites/wfc.json (HRRR, NAM, GFS, ECMWF, AIFS, ICON, NBM ...).
     These are point forecasts for West Harbor itself, not the open Sound.
   - An hour counts as "agreed" when at least agree_fraction of the models
-    that cover that hour show sustained wind at or above the threshold.
+    that cover that hour show sustained wind at or above wind_kn, OR when at
+    least gust_agree_count models show gusts at or above gust_kn. (Models run light on sustained wind at a sheltered
+    harbor point; their gusts carry the storm signal.)
   - Agreed hours close together form one EVENT with a start, peak and end.
   - Wave height in West Harbor is ESTIMATED from the forecast wind and the
     open-water distance (fetch) in that direction. No model resolves the
@@ -57,11 +59,10 @@ COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 
 DEFAULTS = {
-    "wind_kn": 22, "min_hours": 3, "horizon_hours": 72, "agree_fraction": 0.6, "min_models": 2,
+    "wind_kn": 22, "gust_kn": None, "gust_agree_count": None, "min_hours": 3, "horizon_hours": 72, "agree_fraction": 0.6, "min_models": 2,
     "check_hours": [6, 15], "lead_hours": 6, "wave_flag_ft": 2.0, "merge_gap_hours": 3,
     "models": [
         {"name": "HRRR", "id": "ncep_hrrr_conus"},
-        {"name": "NAM", "id": "ncep_nam_conus"},
         {"name": "GFS", "id": "gfs_seamless"},
         {"name": "ECMWF", "id": "ecmwf_ifs025"},
         {"name": "AIFS", "id": "ecmwf_aifs025_single"},
@@ -138,9 +139,22 @@ def analyze(times: list, models: dict, cfg: dict) -> dict:
     """times: list of aware datetimes (hourly). models: {name: {"wind": [...],
     "gust": [...], "dir": [...]}} aligned to times, None where a model has no
     value. Returns the consensus series, per-model summary and agreed events."""
-    thr, frac, min_models = cfg["wind_kn"], cfg["agree_fraction"], cfg["min_models"]
+    thr, gthr = cfg["wind_kn"], cfg.get("gust_kn")
+    frac, min_models = cfg["agree_fraction"], cfg["min_models"]
     n = len(times)
     cons_w, cons_g, cons_d, lo, hi, agree, covered, waves = [], [], [], [], [], [], [], []
+    agree_w, agree_g = [], []
+
+    def enough(vals, level):
+        over = sum(1 for v in vals if v >= level)
+        return len(vals) >= min_models and over > 0 and over >= math.ceil(len(vals) * frac - 1e-9)
+
+    gcount = cfg.get("gust_agree_count")
+
+    def gusts_agree(vals):
+        if gcount:                               # a fixed number of models, e.g. "3 models"
+            return sum(1 for v in vals if v >= gthr) >= gcount
+        return enough(vals, gthr)
     for i in range(n):
         w = [m["wind"][i] for m in models.values() if m["wind"][i] is not None]
         g = [m["gust"][i] for m in models.values() if m["gust"][i] is not None]
@@ -149,8 +163,9 @@ def analyze(times: list, models: dict, cfg: dict) -> dict:
         cons_w.append(cw); cons_g.append(median(g)); cons_d.append(cd)
         lo.append(min(w) if w else None); hi.append(max(w) if w else None)
         covered.append(len(w))
-        over = sum(1 for x in w if x >= thr)
-        agree.append(len(w) >= min_models and over >= math.ceil(len(w) * frac - 1e-9) and over > 0)
+        aw = thr is not None and enough(w, thr)
+        ag = gthr is not None and gusts_agree(g)
+        agree_w.append(aw); agree_g.append(ag); agree.append(aw or ag)
         waves.append(wave_ft(cw, fetch_for(cd, cfg["fetch_nm"])))
 
     # contiguous agreed hours -> events, merging short gaps
@@ -180,6 +195,8 @@ def analyze(times: list, models: dict, cfg: dict) -> dict:
         top_g = max(max((m["gust"][i] or 0) for m in models.values()) for i in idx)
         out_events.append({
             "start": times[a], "end": times[b] + timedelta(hours=1), "hours": b - a + 1,
+            "by": ("both" if any(agree_w[i] for i in idx) and any(agree_g[i] for i in idx)
+                   else "gusts" if any(agree_g[i] for i in idx) else "sustained"),
             "i0": a, "i1": b,
             "peak_kn": cons_w[pk], "peak_time": times[pk],
             "peak_gust_kn": max(gusts) if gusts else None,
@@ -192,16 +209,20 @@ def analyze(times: list, models: dict, cfg: dict) -> dict:
     for name, m in models.items():
         w = [x for x in m["wind"] if x is not None]
         g = [x for x in m["gust"] if x is not None]
-        over = [i for i, x in enumerate(m["wind"]) if x is not None and x >= thr]
+        over = [i for i in range(n)
+                if (thr is not None and m["wind"][i] is not None and m["wind"][i] >= thr)
+                or (gthr is not None and m["gust"][i] is not None and m["gust"][i] >= gthr)]
         per_model.append({
             "name": name, "peak_kn": max(w) if w else None, "peak_gust_kn": max(g) if g else None,
             "hours_over": len(over), "first_over": times[over[0]] if over else None,
             "hours_covered": len(w)})
 
     split = [times[i] for i in range(n) if not agree[i]
-             and any((m["wind"][i] or 0) >= thr for m in models.values())]
+             and any((thr is not None and (m["wind"][i] or 0) >= thr)
+                     or (gthr is not None and (m["gust"][i] or 0) >= gthr) for m in models.values())]
     return {"times": times, "wind": cons_w, "gust": cons_g, "dir": cons_d, "lo": lo, "hi": hi,
-            "agree": agree, "covered": covered, "wave": waves, "events": out_events,
+            "agree": agree, "agree_wind": agree_w, "agree_gust": agree_g,
+            "covered": covered, "wave": waves, "events": out_events,
             "per_model": per_model, "split_hours": split,
             # the FIRST storm is the one to act on; later ones are listed after it
             "main": out_events[0] if out_events else None}
@@ -294,47 +315,77 @@ def r(v) -> str:
     return "—" if v is None else f"{round(v)}"
 
 
+def level_text(cfg: dict) -> str:
+    parts = []
+    if cfg.get("wind_kn") is not None:
+        parts.append(f"{cfg['wind_kn']:g}+ kn sustained")
+    if cfg.get("gust_kn") is not None:
+        n = cfg.get("gust_agree_count")
+        parts.append(f"gusts {cfg['gust_kn']:g}+ kn" + (f" in at least {n} models" if n else ""))
+    return " or ".join(parts)
+
+
+def current_line(cur: Optional[dict], an: dict) -> str:
+    """One bullet: what the WFC dock station reads right now, next to what
+    the models have for this hour."""
+    if not cur:
+        return ""
+    if cur.get("error"):
+        return f"Right now at the WFC dock: station not reporting ({cur['error']})."
+    gust = f", gusting {r(cur['gust_kn'])}" if cur.get("gust_kn") is not None else ""
+    line = (f"Right now at the WFC dock: {r(cur['wind_kn'])} kn{gust} from the {compass(cur.get('dir'))} "
+            f"(station reading, {round(cur.get('age_min', 0))} min ago).")
+    if an["wind"] and an["wind"][0] is not None:
+        mg = f", gusts {r(an['gust'][0])}" if an["gust"][0] is not None else ""
+        line += f" The models have {r(an['wind'][0])} kn{mg} for this hour."
+    return line
+
+
 def build_bullets(an: dict, cfg: dict, now: datetime) -> tuple:
-    """(headline, [bullet, ...]) for the main event, or a quiet summary."""
-    ev, thr = an["main"], cfg["wind_kn"]
+    """(headline, [bullet, ...]) for the first storm, or a quiet summary."""
+    ev, level = an["main"], level_text(cfg)
     n_models = len(an["per_model"])
     if ev is None:
         peak = max((x for x in an["wind"] if x is not None), default=None)
         i = an["wind"].index(peak) if peak is not None else None
-        head = f"No {thr}+ kn sustained wind agreed for West Harbor in the next {cfg['horizon_hours']} hours"
+        head = f"No storm-level wind agreed for West Harbor in the next {cfg['horizon_hours']} hours"
         bullets = []
         if peak is not None:
-            bullets.append(f"Strongest wind the models agree on: {r(peak)} kn from the "
+            gmax = max((g for g in an["gust"] if g is not None), default=None)
+            gtxt = f", gusts to {r(gmax)}" if gmax is not None else ""
+            bullets.append(f"Strongest wind the models agree on: {r(peak)} kn sustained{gtxt}, from the "
                            f"{compass(an['dir'][i])}, {fmt_when(an['times'][i], now)}.")
+        bullets.append(f"Storm level is {level}, for at least {cfg['min_hours']} hours.")
         lone = [m for m in an["per_model"] if m["hours_over"]]
         if lone:
-            bullets.append("Not agreed, but worth watching: " + ", ".join(
-                f"{m['name']} reaches {r(m['peak_kn'])} kn" for m in lone) +
-                f" ({len(lone)} of {n_models} models).")
+            bullets.append("Not agreed, but some models reach storm level: " +
+                           ", ".join(m["name"] for m in lone) + f" ({len(lone)} of {n_models}).")
         return head, bullets
 
     over = [m for m in an["per_model"] if m["hours_over"]]
     under = [m for m in an["per_model"] if not m["hours_over"]]
     d = compass(ev["dir"])
     gust = f", gusts to {r(ev['peak_gust_kn'])}" if ev["peak_gust_kn"] else ""
-    head = (f"{d} wind {thr}+ kn sustained in West Harbor: "
-            f"{fmt_when(ev['start'], now)} to {fmt_when(ev['end'], now)}")
+    head = f"{d} blow in West Harbor: {fmt_when(ev['start'], now)} to {fmt_when(ev['end'], now)}"
     sb = secure_by(ev["start"], cfg["lead_hours"])
+    top = f"The strongest model shows {r(ev['top_model_kn'])} kn sustained"
+    top += f", gusts {r(ev['top_model_gust_kn'])}." if ev["top_model_gust_kn"] else "."
     bullets = [
-        f"What: {d} wind peaking near {r(ev['peak_kn'])} kn sustained{gust}. "
-        f"The strongest model shows {r(ev['top_model_kn'])} kn.",
-        f"Starts: {fmt_when(ev['start'], now)} (first hour the models agree on {thr}+ kn).",
+        f"What: {d} wind peaking near {r(ev['peak_kn'])} kn sustained{gust} at the dock. {top}",
+        f"Starts: {fmt_when(ev['start'], now)} (first hour the models agree on storm-level wind).",
         f"Peaks: {fmt_when(ev['peak_time'], now)}.",
-        f"Ends: {fmt_when(ev['end'], now)}, after about {ev['hours']} hours at or above {thr} kn.",
+        f"Ends: {fmt_when(ev['end'], now)}, after about {ev['hours']} hours at storm level.",
     ]
     wave = ev["wave_ft"]
     if wave is not None:
         flag = " That is above your flag level." if wave >= cfg["wave_flag_ft"] else ""
         bullets.append(f"Waves in West Harbor: about {wave:.1f} ft at the peak, estimated from wind and "
                        f"open water to the {d}.{flag}")
-    agree = f"Model agreement: {len(over)} of {n_models} models reach {thr}+ kn"
+    agree = f"Model agreement: {len(over)} of {n_models} models reach storm level ({level})"
     if under:
-        agree += "; " + ", ".join(f"{m['name']} tops out at {r(m['peak_kn'])}" for m in under)
+        agree += "; " + ", ".join(
+            f"{m['name']} tops out at {r(m['peak_kn'])} kn" +
+            (f", gusts {r(m['peak_gust_kn'])}" if m["peak_gust_kn"] is not None else "") for m in under)
     bullets.append(agree + ".")
     if sb > now:
         bullets.append(f"Have everything secured by {fmt_when(sb, now)}.")
@@ -343,7 +394,7 @@ def build_bullets(an: dict, cfg: dict, now: datetime) -> tuple:
     if len(an["events"]) > 1:
         others = [e for e in an["events"] if e is not ev]
         bullets.append("After that: " + "; ".join(
-            f"another {thr}+ kn spell {fmt_when(e['start'], now)} to {fmt_when(e['end'], now)}, "
+            f"another spell {fmt_when(e['start'], now)} to {fmt_when(e['end'], now)}, "
             f"peaking near {r(e['peak_kn'])} kn" for e in others) + ".")
     return head, bullets
 
@@ -351,7 +402,8 @@ def build_bullets(an: dict, cfg: dict, now: datetime) -> tuple:
 # ============================================================================
 # Graphic
 # ============================================================================
-def render_png(an: dict, cfg: dict, now: datetime, headline: str, tag: str = "") -> Optional[bytes]:
+def render_png(an: dict, cfg: dict, now: datetime, headline: str, tag: str = "",
+               cur: Optional[dict] = None) -> Optional[bytes]:
     try:
         import io
         import matplotlib
@@ -365,7 +417,7 @@ def render_png(an: dict, cfg: dict, now: datetime, headline: str, tag: str = "")
     NAVY, RED, MIST = "#071D49", "#C10016", "#C0CFD7"
     INK, MUTED, GRID, BG = "#14212b", "#5a6b78", "#e3e8ec", "#ffffff"
     WIND, GUST, BAND, WAVE = "#1a66ad", "#cf6310", "#d5e3ef", "#7fa8c9"
-    times, thr = an["times"], cfg["wind_kn"]
+    times, thr, gthr = an["times"], cfg.get("wind_kn"), cfg.get("gust_kn")
     x = [(t - times[0]).total_seconds() / 3600 for t in times]
     num = lambda s: [float("nan") if v is None else v for v in s]
 
@@ -382,21 +434,37 @@ def render_png(an: dict, cfg: dict, now: datetime, headline: str, tag: str = "")
         ax.text(0.965, 0.66, tag, color="#ffd9a8", fontsize=10, fontweight="bold", va="center", ha="right")
 
     ax = fig.add_subplot(gs[1]); ax.set_facecolor(BG)
-    top_val = max([v for v in an["hi"] + an["gust"] if v is not None] + [thr + 6])
+    top_val = max([v for v in an["hi"] + an["gust"] if v is not None] + [(gthr or thr or 20) + 6])
     ymax = math.ceil((top_val + 5) / 5) * 5
     ax.set_xlim(x[0], x[-1]); ax.set_ylim(0, ymax)
     for ev in an["events"]:
         ax.axvspan(x[ev["i0"]], x[ev["i1"]] + 1, color="#fbeaea", zorder=0)
-        ax.text((x[ev["i0"]] + x[ev["i1"]] + 1) / 2, ymax * 0.985, f"{thr}+ KN AGREED", color=RED,
+        ax.text((x[ev["i0"]] + x[ev["i1"]] + 1) / 2, ymax * 0.985, "STORM WINDOW", color=RED,
                 fontsize=7.2, fontweight="bold", ha="center", va="top")
     for y in range(10, int(ymax), 10):
         ax.axhline(y, color=GRID, lw=0.8, zorder=1)
     ax.fill_between(x, num(an["lo"]), num(an["hi"]), color=BAND, zorder=2, lw=0)
     ax.plot(x, num(an["gust"]), color=GUST, lw=1.6, ls=(0, (4, 2)), zorder=4)
     ax.plot(x, num(an["wind"]), color=WIND, lw=2.2, zorder=5)
-    ax.axhline(thr, color=INK, lw=0.9, ls=(0, (5, 3)), zorder=3)
-    ax.text(x[-1] - 0.4, thr + ymax * 0.012, f"Briefing level: {thr} kn sustained", color=INK,
-            fontsize=7.2, ha="right", va="bottom")
+    if thr is not None:
+        ax.axhline(thr, color=INK, lw=0.9, ls=(0, (5, 3)), zorder=3)
+        ax.text(x[-1] - 0.4, thr + ymax * 0.012, f"Storm level: {thr:g} kn sustained", color=INK,
+                fontsize=7.2, ha="right", va="bottom")
+    if gthr is not None:
+        ax.axhline(gthr, color=INK, lw=0.9, ls=(0, (1.5, 2.5)), zorder=3)
+        ax.text(x[-1] - 0.4, gthr + ymax * 0.012, f"Storm level: {gthr:g} kn gusts", color=INK,
+                fontsize=7.2, ha="right", va="bottom")
+    # what the dock station reads right now, at the left edge
+    if cur and not cur.get("error") and cur.get("wind_kn") is not None:
+        ax.plot([x[0]], [cur["wind_kn"]], "o", ms=7, mfc=BG, mec=WIND, mew=2, zorder=7, clip_on=False)
+        label = f"Dock now: {r(cur['wind_kn'])} kn"
+        if cur.get("gust_kn") is not None:
+            ax.plot([x[0]], [cur["gust_kn"]], "D", ms=6, mfc=BG, mec=GUST, mew=2, zorder=7, clip_on=False)
+            label += f", gust {r(cur['gust_kn'])}"
+        ax.annotate(label, xy=(x[0], max(cur["wind_kn"], cur.get("gust_kn") or 0)),
+                    xytext=(8, 10), textcoords="offset points", color=INK, fontsize=7.4, fontweight="bold",
+                    va="bottom", ha="left", zorder=8,
+                    bbox=dict(boxstyle="round,pad=0.25", fc=BG, ec=MIST, lw=0.8))
     # day dividers and labels
     ticks, labels = [], []
     for xi, t in zip(x, times):
@@ -470,14 +538,13 @@ def esc(s) -> str:
 
 
 def build_email(headline, bullets, assets, an, cfg, now, has_image, note="") -> tuple:
-    thr = cfg["wind_kn"]
     rows = [(m["name"], r(m["peak_kn"]), r(m["peak_gust_kn"]),
              f"{m['hours_over']} h" if m["hours_over"] else "none",
              fmt_when(m["first_over"], now) if m["first_over"] else "—") for m in an["per_model"]]
     text = headline + "\n\n" + "\n".join(f"  • {b}" for b in bullets)
     if assets:
         text += "\n\nSecure before it arrives:\n" + "\n".join(f"  [ ] {l}: {a}" for l, a in assets)
-    text += f"\n\nModel by model (peak sustained / peak gust / hours at {thr}+ kn / first hour):\n"
+    text += "\n\nModel by model (peak sustained / peak gust / hours at storm level / first hour):\n"
     text += "\n".join(f"  {n:<6} {p:>3} kn / {g:>3} kn / {h:>5} / {f}" for n, p, g, h, f in rows)
     if note:
         text += "\n\n" + note
@@ -496,10 +563,10 @@ def build_email(headline, bullets, assets, an, cfg, now, has_image, note="") -> 
                  "".join(f'<tr><td style="padding:6px 8px;border-top:1px solid #e3e8ec;white-space:nowrap;'
                          f'vertical-align:top"><b>{esc(l)}</b></td><td style="padding:6px 8px;border-top:1px solid #e3e8ec">'
                          f'{esc(a)}</td></tr>' for l, a in assets) + "</table>")
-    h.append(f'<p style="margin:14px 0 4px"><b>Model by model</b></p>'
+    h.append('<p style="margin:14px 0 4px"><b>Model by model</b></p>'
              '<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px">'
              '<tr style="color:#555"><td style="padding:4px 10px 4px 0">Model</td><td style="padding:4px 10px">Peak sustained</td>'
-             f'<td style="padding:4px 10px">Peak gust</td><td style="padding:4px 10px">Hours at {thr}+ kn</td>'
+             '<td style="padding:4px 10px">Peak gust</td><td style="padding:4px 10px">Hours at storm level</td>'
              '<td style="padding:4px 10px">First hour</td></tr>' +
              "".join(f'<tr><td style="padding:4px 10px 4px 0;border-top:1px solid #e3e8ec"><b>{esc(n)}</b></td>'
                      f'<td style="padding:4px 10px;border-top:1px solid #e3e8ec">{esc(p)} kn</td>'
@@ -664,23 +731,27 @@ def backtest(raw_site: dict, cfg: dict, now: datetime, days: int = 365) -> int:
     months = days / 30.44
     DAY = 24
 
-    print(f"\nSUSTAINED WIND (the briefing rule). Target: one or two storms a month.")
-    print(f"  {'Level':>8}  {'Storms':>7}  {'Per month':>10}")
-    at_level = {}
-    for level in (12, 14, 16, 18, 20, 22, 24, 26):
-        c = dict(cfg, wind_kn=level, merge_gap_hours=0, min_hours=1)
-        an = analyze(times, models, c)
-        storms = runs(an["agree"], cfg["min_hours"], DAY)
-        at_level[level] = (an, storms)
-        mark = "   <- current setting" if level == cfg["wind_kn"] else ""
-        print(f"  {level:>5} kn  {len(storms):>7}  {len(storms) / months:>10.1f}{mark}")
+    def storms_for(wind_kn, gust_kn):
+        c = dict(cfg, wind_kn=wind_kn, gust_kn=gust_kn, merge_gap_hours=0, min_hours=1)
+        a = analyze(times, models, c)
+        return a, runs(a["agree"], cfg["min_hours"], DAY)
 
-    an = at_level[min(at_level, key=lambda L: abs(L - cfg["wind_kn"]))][0]
-    print(f"\nGUSTS instead (model-consensus gust, same {cfg['min_hours']}-hour rule):")
+    print("\nSUSTAINED WIND only. Target: one or two storms a month.")
     print(f"  {'Level':>8}  {'Storms':>7}  {'Per month':>10}")
-    for level in (25, 30, 35, 40, 45):
-        storms = runs([(g or 0) >= level for g in an["gust"]], cfg["min_hours"], DAY)
-        print(f"  {level:>5} kn  {len(storms):>7}  {len(storms) / months:>10.1f}")
+    for level in (10, 12, 14, 16, 18, 20, 22, 24, 26):
+        _, st = storms_for(level, None)
+        print(f"  {level:>5} kn  {len(st):>7}  {len(st) / months:>10.1f}")
+
+    print("\nGUSTS only:")
+    print(f"  {'Level':>8}  {'Storms':>7}  {'Per month':>10}")
+    by_gust = {}
+    for level in (22, 24, 26, 28, 30, 32, 34, 36, 40):
+        a, st = storms_for(None, level)
+        by_gust[level] = (a, st)
+        print(f"  {level:>5} kn  {len(st):>7}  {len(st) / months:>10.1f}")
+
+    an, mine = storms_for(cfg.get("wind_kn"), cfg.get("gust_kn"))
+    print(f"\nCURRENT SETTING ({level_text(cfg)}): {len(mine)} storms, {len(mine) / months:.1f} a month")
 
     def describe(a, b):
         idx = range(a, b + 1)
@@ -689,26 +760,30 @@ def backtest(raw_site: dict, cfg: dict, now: datetime, days: int = 365) -> int:
         return (f"  {times[a]:%a %b %d %Y}  {b - a + 1:>3} h  peak {r(an['wind'][pk])} kn sustained, "
                 f"gusts {r(gust)} kn, {compass(an['dir'][pk])}")
 
-    for level in sorted({cfg["wind_kn"], 18, 16}, reverse=True):
-        if level not in at_level:
-            continue
-        storms = at_level[level][1]
-        print(f"\nEvery storm at the {level} kn level ({len(storms)}):")
-        for a, b in storms[-40:]:
+    print("\nEvery storm at the current setting:")
+    for a, b in mine:
+        print(describe(a, b))
+    if not mine:
+        print("  none")
+    for level in (30, 26):
+        st = by_gust[level][1]
+        print(f"\nEvery storm at gusts {level}+ kn ({len(st)}):")
+        for a, b in st:
             print(describe(a, b))
-        if not storms:
-            print("  none")
 
-    print("\nThe 15 windiest days in the period (model consensus), to compare with what you remember:")
-    by_day = {}
+    print("\nThe 20 windiest days in the period (model consensus), to compare with what you remember:")
+    best = {}
     for i, t in enumerate(times):
-        if an["wind"][i] is not None:
-            k = t.date()
-            if k not in by_day or an["wind"][i] > an["wind"][by_day[k]]:
-                by_day[k] = i
-    for k, i in sorted(by_day.items(), key=lambda kv: -an["wind"][kv[1]])[:15]:
-        gust = max((an["gust"][j] or 0) for j in range(len(times)) if times[j].date() == k)
-        print(f"  {times[i]:%a %b %d %Y}  {r(an['wind'][i])} kn sustained, gusts {r(gust)} kn, {compass(an['dir'][i])}")
+        k = t.date()
+        w, g = an["wind"][i], an["gust"][i]
+        cur_w, cur_g, cur_i = best.get(k, (0, 0, i))
+        if w is not None and w > cur_w:
+            cur_w, cur_i = w, i
+        if g is not None and g > cur_g:
+            cur_g = g
+        best[k] = (cur_w, cur_g, cur_i)
+    for k, (w, g, i) in sorted(best.items(), key=lambda kv: -kv[1][1])[:20]:
+        print(f"  {times[i]:%a %b %d %Y}  {r(w)} kn sustained, gusts {r(g)} kn, {compass(an['dir'][i])}")
     if failed:
         print("\nModels with no archive: " + ", ".join(n for n, _ in failed))
     return 0
@@ -752,6 +827,26 @@ def is_due(now: datetime, cfg: dict, b: dict) -> bool:
 # ============================================================================
 # Entry points
 # ============================================================================
+def current_dock(raw_site: dict) -> Optional[dict]:
+    """The WFC dock Tempest's reading right now, or {"error": why}. None when
+    the site has no Tempest. Never raises: the briefing goes out regardless."""
+    src = next((s_ for s_ in raw_site.get("observation_sources", [])
+                if s_.get("type") == "tempest" and s_.get("enabled", True) is not False
+                and s_.get("station_id")), None)
+    if src is None:
+        return None
+    try:
+        import tempest
+        t = tempest.fetch_tempest(src["station_id"], auth=src.get("auth", "token"))
+        age = (time.time() - t["observed_epoch"]) / 60
+        if age > 30:
+            return {"error": f"last reading {age:.0f} min old"}
+        return {"wind_kn": t["wind_kn"], "gust_kn": t.get("gust_kn"), "dir": t.get("wind_dir_deg"),
+                "age_min": max(age, 0)}
+    except Exception as e:
+        return {"error": str(e)[:120] or type(e).__name__}
+
+
 def send(subject, text, html, png) -> Optional[bool]:
     import monitor
     to = (os.environ.get("BRIEFING_TO") or "").strip()
@@ -792,6 +887,9 @@ def main(argv: list) -> int:
     an = analyze(times, models, cfg)
     headline, bullets = build_bullets(an, cfg, now)
     ev = an["main"]
+    cur = current_dock(raw_site)
+    if cur:
+        bullets.insert(0, current_line(cur, an))
     assets = assets_to_secure(ev, an, cfg) if ev else []
     note = ""
     if failed:
@@ -801,12 +899,12 @@ def main(argv: list) -> int:
         print("  •", line)
     for m in an["per_model"]:
         print(f"  {m['name']:<6} peak {r(m['peak_kn'])} kn, gust {r(m['peak_gust_kn'])} kn, "
-              f"{m['hours_over']} h at {cfg['wind_kn']}+")
+              f"{m['hours_over']} h at storm level")
     if mode == "--print":
         return 0
 
     if mode == "--preview":
-        png = render_png(an, cfg, now, headline, "PREVIEW")
+        png = render_png(an, cfg, now, headline, "PREVIEW", cur)
         text, html = build_email("PREVIEW (manual test). " + headline, bullets, assets, an, cfg, now,
                                  png is not None, note)
         ok = send(f"🧪 {tag} storm briefing (preview) — {now:%a %-I:%M %p}", text, html, png)
@@ -818,11 +916,12 @@ def main(argv: list) -> int:
     p_start, p_end = (_t(prev.get("start")), _t(prev.get("end"))) if prev else (None, None)
 
     def deliver(kind: str) -> bool:
-        png = render_png(an, cfg, now, headline, "UPDATE" if kind == "update" else "")
+        png = render_png(an, cfg, now, headline, "UPDATE" if kind == "update" else "", cur)
         text, html = build_email(headline, bullets, assets, an, cfg, now, png is not None, note)
         lead = "Update: " if kind == "update" else ""
-        return send(f"⚠️ {tag} storm briefing — {lead}{compass(ev['dir'])} {cfg['wind_kn']}+ kn "
-                    f"{fmt_when(ev['start'], now)}", text, html, png) is True
+        gusts = f", gusts to {r(ev['peak_gust_kn'])} kn" if ev["peak_gust_kn"] else ""
+        return send(f"⚠️ {tag} storm briefing — {lead}{compass(ev['dir'])} blow from "
+                    f"{fmt_when(ev['start'], now)}{gusts}", text, html, png) is True
 
     if ev is not None and not same_storm(prev, sig):
         if not deliver("new"):
@@ -843,10 +942,10 @@ def main(argv: list) -> int:
     elif prev is not None:
         if p_start is not None and now < p_start:
             # briefed, and it has dropped out of the forecast before arriving
-            png = render_png(an, cfg, now, headline, "STAND DOWN")
+            png = render_png(an, cfg, now, headline, "STAND DOWN", cur)
             text, html = build_email("Stand down: the storm briefed earlier is no longer expected. " + headline,
                                      bullets, [], an, cfg, now, png is not None, note)
-            if send(f"✅ {tag} storm briefing — stand down, {cfg['wind_kn']}+ kn no longer agreed",
+            if send(f"✅ {tag} storm briefing — stand down, storm no longer expected",
                     text, html, png) is not True:
                 return 1
             b["sent"] = None
