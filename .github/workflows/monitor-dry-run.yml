@@ -18,6 +18,8 @@ jobs:
       - name: Run monitor (dry run)
         env:
           DRY_RUN: "1"
+          TEMPEST_TOKEN:   ${{ secrets.TEMPEST_TOKEN }}
+          TEMPEST_API_KEY: ${{ secrets.TEMPEST_API_KEY }}
         run: python monitor.py
       - name: Show the status snapshot
         if: always()
