@@ -55,6 +55,22 @@ class Observation:
     peak_gust_kn: Optional[float] = None
 
 
+@dataclass
+class Lightning:
+    """The closest measured lightning strike still inside the hold window."""
+    distance_mi: float
+    minutes_ago: float
+    station: str
+    sensor_offline: bool = False   # True = held from memory; the sensor didn't answer this run
+
+
+def lightning_active(lightning: Optional["Lightning"], site: Site) -> bool:
+    s = site.shared
+    return (lightning is not None and s.lightning_stop_mi is not None
+            and lightning.distance_mi <= s.lightning_stop_mi
+            and lightning.minutes_ago <= s.lightning_hold_min)
+
+
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
@@ -108,9 +124,18 @@ def classify_nws(alert_names, site: Site) -> tuple:
     return stop, caution
 
 
-def hazard_findings(cond: Conditions, site: Site, nws_stop: bool, nws_caution: bool) -> Call:
+def hazard_findings(cond: Conditions, site: Site, nws_stop: bool, nws_caution: bool,
+                    lightning: Optional[Lightning] = None) -> Call:
     """Non-wind hazards; these apply to every activity."""
     c, s = Call(), site.shared
+    if lightning_active(lightning, site):
+        left = max(0, round(s.lightning_hold_min - lightning.minutes_ago))
+        text = (f"Lightning {lightning.distance_mi:.1f} mi away, {round(lightning.minutes_ago)} min ago "
+                f"— clear the water. Holds {left} more min unless it strikes again "
+                f"— MEASURED at {lightning.station}")
+        if lightning.sensor_offline:
+            text += " (sensor not answering now; holding on the last strike it reported)"
+        c.add(Finding("STOP", "lightning", text, lightning.distance_mi))
     if cond.storm:
         c.add(Finding("STOP", "thunderstorm", "Thunderstorm overhead — clear the water"))
     if nws_stop:
@@ -154,8 +179,9 @@ def wind_findings(limits: Limits, wind, gust, direction, site: Site) -> Call:
 
 
 def forecast_call(unit: Unit, cond: Conditions, site: Site,
-                  nws_stop: bool = False, nws_caution: bool = False) -> Call:
-    c = hazard_findings(cond, site, nws_stop, nws_caution)
+                  nws_stop: bool = False, nws_caution: bool = False,
+                  lightning: Optional[Lightning] = None) -> Call:
+    c = hazard_findings(cond, site, nws_stop, nws_caution, lightning)
     c.extend(wind_findings(unit.limits, cond.wind_kn, cond.gust_kn, cond.dir_deg, site))
     return c
 
@@ -176,10 +202,11 @@ def observed_call(unit: Unit, obs: Optional[Observation], site: Site) -> Call:
 
 
 def activity_call(unit: Unit, cond: Conditions, obs: Optional[Observation], site: Site,
-                  nws_stop: bool = False, nws_caution: bool = False) -> dict:
+                  nws_stop: bool = False, nws_caution: bool = False,
+                  lightning: Optional[Lightning] = None) -> dict:
     """Forecast and measured calls combined — worst case wins, so a measured
     exceedance raises the call even when the models say calm."""
-    f = forecast_call(unit, cond, site, nws_stop, nws_caution)
+    f = forecast_call(unit, cond, site, nws_stop, nws_caution, lightning)
     o = observed_call(unit, obs, site)
     combined = Call()
     combined.extend(f)
