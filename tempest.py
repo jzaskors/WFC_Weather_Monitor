@@ -161,14 +161,134 @@ def fetch_raw(station_id, auth: str = "public",
         raise TempestUnavailable(f"response was not JSON (status {r.status_code})") from exc
 
 
+# --- Public-station route -------------------------------------------------
+# For a station on someone else's account the observations endpoint answers
+# 404 even when the station is public. tempestwx.com's own station page reads
+# current conditions from better_forecast instead, so public stations fall back
+# to that. Guard: only trusted when the station reports itself online and the
+# reading is fresh (monitor.py applies max_age_min).
+FORECAST = "https://swd.weatherflow.com/swd/rest/better_forecast"
+STATIONS = "https://swd.weatherflow.com/swd/rest/stations"
+
+
+def fetch_public_raw(station_id, session: Optional[requests.Session] = None) -> dict:
+    http = session or requests
+    params = dict(_auth_params("public"), station_id=int(station_id),
+                  units_wind="mps", units_temp="c", units_pressure="mb",
+                  units_precip="mm", units_distance="km")
+    try:
+        r = http.get(FORECAST, params=params, timeout=REQUEST_TIMEOUT_SECONDS,
+                     headers={"User-Agent": "WFC-weather-monitor/1.0 (waterfront safety monitoring)",
+                              "Accept": "application/json"})
+    except requests.RequestException as exc:
+        raise TempestUnavailable(f"public route request failed: {exc}") from exc
+    if r.status_code == 404:
+        raise TempestUnavailable(f"HTTP 404 on both routes: station {station_id} not found "
+                                 f"(check the number in its tempestwx.com link)")
+    if r.status_code in (401, 403):
+        raise TempestUnavailable(f"HTTP {r.status_code} on public route: station {station_id} "
+                                 f"is not public, or the public key changed")
+    try:
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as exc:
+        raise TempestUnavailable(f"public route request failed: {exc}") from exc
+    except ValueError as exc:
+        raise TempestUnavailable(f"public route response was not JSON (status {r.status_code})") from exc
+
+
+def parse_public(payload: dict, now: Optional[float] = None) -> dict:
+    now = time.time() if now is None else now
+    if not isinstance(payload, dict):
+        raise TempestUnavailable("public route payload was not an object")
+    status = payload.get("status") or {}
+    if status.get("status_code", 0) != 0:
+        raise TempestUnavailable(f"public route status {status.get('status_code')}: "
+                                 f"{status.get('status_message')}")
+    st = payload.get("station") or {}
+    if st.get("is_station_online") is False:
+        raise TempestUnavailable("station reports itself offline")
+    cc = payload.get("current_conditions") or {}
+    ts = _num(cc.get("time"))
+    if ts is None:
+        raise TempestUnavailable("public route has no current-conditions time")
+    if ts - now > MAX_FUTURE_SECONDS:
+        raise TempestUnavailable("public route timestamp is in the future — clock skew?")
+    wind_ms = _num(cc.get("wind_avg"))
+    if wind_ms is None:
+        raise TempestUnavailable("public route has no wind_avg (station may lack a wind sensor)")
+    wind_kn = wind_ms * MS_TO_KN
+    if not (0 <= wind_kn <= 100):
+        raise TempestUnavailable(f"implausible wind speed {wind_kn:.1f} kn")
+    gust_ms = _num(cc.get("wind_gust"))
+    gust_kn = None if gust_ms is None else max(gust_ms * MS_TO_KN, wind_kn)
+    d = _num(cc.get("wind_direction"))
+    temp_c = _num(cc.get("air_temperature"))
+    return {
+        "wind_kn": wind_kn, "gust_kn": gust_kn,
+        "wind_dir_deg": None if d is None else int(d) % 360,
+        "observed_epoch": ts,
+        "station_name": payload.get("location_name"),
+        "gust_monitored": gust_kn is not None,
+        "lull_kn": None if _num(cc.get("wind_lull")) is None else _num(cc.get("wind_lull")) * MS_TO_KN,
+        "air_temp_f": None if temp_c is None else temp_c * 9 / 5 + 32,
+        "humidity_pct": _num(cc.get("relative_humidity")),
+        "sea_level_pressure_mb": _num(cc.get("sea_level_pressure")),
+        "rain_last_hr_mm": None,
+        "lightning_last_3hr": _num(cc.get("lightning_strike_count_last_3hr")),
+        "lightning_last_km": _num(cc.get("lightning_strike_last_distance")),
+        "route": "public",
+    }
+
+
 def fetch_tempest(station_id, auth: str = "public",
                   session: Optional[requests.Session] = None) -> dict:
-    """Fetch + parse one Tempest station (monitor.py entry point)."""
-    return parse_tempest(fetch_raw(station_id, auth, session))
+    """Fetch + parse one Tempest station (monitor.py entry point).
+    Public stations try the observations endpoint, then the public route."""
+    try:
+        return parse_tempest(fetch_raw(station_id, auth, session))
+    except TempestUnavailable as first:
+        if auth != "public":
+            raise
+        try:
+            return parse_public(fetch_public_raw(station_id, session))
+        except TempestUnavailable as second:
+            raise TempestUnavailable(f"{first}; then {second}") from second
+
+
+def account_report(token: str) -> None:
+    """Diagnostic: every station and device on the token's account, with each
+    device's latest reading. Shows whether the sensor moved to a new station ID."""
+    try:
+        r = requests.get(STATIONS, params={"token": token}, timeout=REQUEST_TIMEOUT_SECONDS)
+        data = r.json()
+    except Exception as e:
+        print(f"  could not list account stations: {e}")
+        return
+    stations = data.get("stations") or []
+    print(f"  account has {len(stations)} station(s):")
+    for st in stations:
+        print(f"  - station {st.get('station_id')} \"{st.get('name')}\"")
+        for dv in st.get("devices") or []:
+            line = (f"      device {dv.get('device_id')} type {dv.get('device_type')} "
+                    f"serial {dv.get('serial_number')}")
+            if dv.get("device_type") in ("ST", "SK", "AR"):
+                try:
+                    o = requests.get(f"https://swd.weatherflow.com/swd/rest/observations/device/{dv['device_id']}",
+                                     params={"token": token}, timeout=REQUEST_TIMEOUT_SECONDS).json()
+                    obs = o.get("obs") or []
+                    if obs:
+                        age = (time.time() - obs[-1][0]) / 60
+                        line += f" — last reading {age:.0f} min ago"
+                    else:
+                        line += " — no readings"
+                except Exception as e:
+                    line += f" — reading check failed ({e})"
+            print(line)
 
 
 if __name__ == "__main__":
-    # Diagnostic: python tempest.py 61040:token 123456:public
+    # Diagnostic: python tempest.py 61040:token 184785:public
     # (the "Tempest check" workflow runs every Tempest source in the site file).
     targets = sys.argv[1:]
     if not targets:
@@ -183,7 +303,19 @@ if __name__ == "__main__":
             raw = fetch_raw(sid, auth)
             print(json.dumps({k: raw.get(k) for k in ("station_name", "public_name", "status")}, indent=2))
             print("latest obs:", json.dumps((raw.get("obs") or [None])[0])[:1500])
-            obs = parse_tempest(raw)
+        except TempestUnavailable as e:
+            print(f"observations route: {e}")
+        if auth == "public":
+            try:
+                praw = fetch_public_raw(sid)
+                print("public route station:", json.dumps(praw.get("station"))[:500])
+                print("public route current:", json.dumps(praw.get("current_conditions"))[:1500])
+            except TempestUnavailable as e:
+                print(f"public route: {e}")
+        if auth == "token":
+            account_report(os.environ.get("TEMPEST_TOKEN", "").strip())
+        try:
+            obs = fetch_tempest(sid, auth)
         except TempestUnavailable as e:
             print(f"FAILED — {e}")
             bad += 1
@@ -191,5 +323,6 @@ if __name__ == "__main__":
         age = (time.time() - obs["observed_epoch"]) / 60
         g = "--" if obs["gust_kn"] is None else f"{obs['gust_kn']:.1f}"
         print(f"PARSED OK: {obs['wind_kn']:.1f} kn g{g} from {obs['wind_dir_deg']}° "
-              f"({age:.0f} min ago) — {obs['station_name']}")
+              f"({age:.0f} min ago) — {obs['station_name']}"
+              f"{' [public route]' if obs.get('route') == 'public' else ''}")
     raise SystemExit(1 if bad else 0)
