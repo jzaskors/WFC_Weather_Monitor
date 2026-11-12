@@ -89,6 +89,14 @@ except Exception as _e:
           f"The file must be named lowercase 'tempest.py'.")
     fetch_tempest, TempestUnavailable = None, Exception
 
+# Weather Underground station fetcher (wunderground.py, same folder, lowercase name).
+try:
+    from wunderground import fetch_wu, WUUnavailable
+except Exception as _e:
+    print(f"!!! wunderground module unavailable ({_e}); Weather Underground stations will be "
+          f"skipped. The file must be named lowercase 'wunderground.py'.")
+    fetch_wu, WUUnavailable = None, Exception
+
 # Conditions graphic (render_conditions.py + Pillow). Optional: alerts still
 # go out as HTML + text without it.
 try:
@@ -344,8 +352,29 @@ def _obs_tempest(src) -> Observation:
                        gust_monitored=t["gust_monitored"])
 
 
+def _obs_wunderground(src) -> Observation:
+    if fetch_wu is None:
+        raise SourceError("wunderground.py not importable")
+    sid = src.params.get("station")
+    if not sid:
+        raise SourceError("no station set in the site file")
+    try:
+        w = fetch_wu(sid, session=HTTP)
+    except WUUnavailable as e:
+        raise SourceError(str(e))
+    except Exception as e:
+        raise SourceError(type(e).__name__)      # no message: it could hold the request URL
+    age = (time.time() - w["observed_epoch"]) / 60
+    if age > src.max_age_min:
+        raise SourceError(f"stale ({age:.0f} min old)")
+    return Observation(wind_kn=w["wind_kn"], gust_kn=w["gust_kn"], dir_deg=w["wind_dir_deg"],
+                       station=src.label, age_min=max(age, 0),
+                       exposure_offset_kn=src.exposure_offset_kn,
+                       gust_monitored=w["gust_monitored"])
+
+
 OBS_FETCHERS = {"weatherlink_embed": _obs_weatherlink_embed, "ndbc": _obs_ndbc,
-                "tempest": _obs_tempest}
+                "tempest": _obs_tempest, "wunderground": _obs_wunderground}
 
 
 def fetch_observation() -> tuple:
@@ -868,5 +897,41 @@ def main():
                      json.dumps({k: summary.get(k) for k in ("open", "sent", "degraded", "gaps")}))
 
 
+def station_report() -> int:
+    """`python monitor.py --stations`: every station in the site file, side by
+    side, including ones switched off. Reads only: no alerts, no state change."""
+    from wxcore.config import site_from_dict
+    raw = json.loads(Path(os.environ.get("SITE_FILE") or ROOT / "sites" / "wfc.json").read_text())
+    off = {s["id"] for s in raw.get("observation_sources", []) if s.get("enabled", True) is False}
+    for s in raw.get("observation_sources", []):
+        s["enabled"] = True
+    site = site_from_dict(raw)
+    print(f"Station check for {site.name} at {now_local():%a %b %d %I:%M %p %Z}\n")
+    print(f"{'#':>2}  {'Station':<34} {'Wind':>7} {'Gust':>7} {'From':>5} {'Age':>7}  Notes")
+    ok = 0
+    for i, src in enumerate(site.observation_sources, 1):
+        tag = "OFF in settings. " if src.id in off else ""
+        fn = OBS_FETCHERS.get(src.type)
+        try:
+            if fn is None:
+                raise SourceError(f"unsupported source type '{src.type}'")
+            o = fn(src)
+        except (SourceError, KeyError, ValueError) as e:
+            print(f"{i:>2}  {src.label:<34} {'--':>7} {'--':>7} {'--':>5} {'--':>7}  {tag}FAILED: {e}")
+            continue
+        ok += 1
+        gust = f"{o.gust_kn:.0f} kn" if o.gust_kn is not None else "none"
+        note = tag + (f"judged +{src.exposure_offset_kn:g} kn (exposed)" if src.exposure_offset_kn else "")
+        if o.gust_kn is None and o.peak_gust_kn is not None:
+            note += f" day peak {o.peak_gust_kn:.0f} kn"
+        print(f"{i:>2}  {src.label:<34} {o.wind_kn:>4.0f} kn {gust:>7} {compass(o.dir_deg):>5} "
+              f"{o.age_min:>4.0f} min  {note}")
+    print(f"\n{ok} of {len(site.observation_sources)} stations answered. "
+          f"The monitor uses the first one in this list that answers and isn't switched off.")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--stations" in sys.argv[1:]:
+        sys.exit(station_report())
     main()
