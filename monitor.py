@@ -46,6 +46,7 @@ import requests
 
 from wxcore import (Conditions, Observation, LEVEL_WORD, ORDER, advance, assess,
                     in_operating_hours, load_site)
+from wxcore.engine import Lightning, lightning_active
 
 ROOT = Path(__file__).resolve().parent
 SITE = load_site(os.environ.get("SITE_FILE") or ROOT / "sites" / "wfc.json")
@@ -83,19 +84,19 @@ except Exception as _e:
 
 # WeatherFlow Tempest fetcher (tempest.py, same folder, lowercase name).
 try:
-    from tempest import fetch_tempest, TempestUnavailable
+    from tempest import fetch_tempest, fetch_lightning, TempestUnavailable
 except Exception as _e:
     print(f"!!! tempest module unavailable ({_e}); Tempest stations will be skipped. "
           f"The file must be named lowercase 'tempest.py'.")
-    fetch_tempest, TempestUnavailable = None, Exception
+    fetch_tempest, fetch_lightning, TempestUnavailable = None, None, Exception
 
 # Weather Underground station fetcher (wunderground.py, same folder, lowercase name).
 try:
-    from wunderground import fetch_wu, WUUnavailable
+    from wunderground import fetch_wu, nearby_stations, WUUnavailable
 except Exception as _e:
     print(f"!!! wunderground module unavailable ({_e}); Weather Underground stations will be "
           f"skipped. The file must be named lowercase 'wunderground.py'.")
-    fetch_wu, WUUnavailable = None, Exception
+    fetch_wu, nearby_stations, WUUnavailable = None, None, Exception
 
 # Conditions graphic (render_conditions.py + Pillow). Optional: alerts still
 # go out as HTML + text without it.
@@ -377,6 +378,55 @@ OBS_FETCHERS = {"weatherlink_embed": _obs_weatherlink_embed, "ndbc": _obs_ndbc,
                 "tempest": _obs_tempest, "wunderground": _obs_wunderground}
 
 
+# --- Lightning -----------------------------------------------------------------
+def lightning_status(st: dict, now_epoch: float) -> tuple:
+    """(Lightning or None, log line, gap note or None).
+
+    Asks every station flagged "lightning": true for the closest strike in the
+    hold window. A strike inside the halt radius is REMEMBERED in state.json,
+    so the halt runs its full time even if the sensor then goes offline (storms
+    knock out power and WiFi) or reports a later, more distant strike."""
+    stop_mi, hold_min = SITE.shared.lightning_stop_mi, SITE.shared.lightning_hold_min
+    if stop_mi is None:
+        return None, None, None
+    sensors = [s for s in SITE.observation_sources
+               if s.type == "tempest" and s.params.get("lightning")]
+    gap, line, checked = None, None, False
+    if not sensors or fetch_lightning is None:
+        gap = "No lightning sensor available — the lightning rule was NOT checked this run"
+        sensors = []
+    for src in sensors:
+        try:
+            r = fetch_lightning(src.params.get("station_id"), auth=src.params.get("auth", "token"),
+                                device_id=src.params.get("device_id"), window_min=hold_min,
+                                session=HTTP, now=now_epoch)
+        except Exception as e:
+            why = str(e) if isinstance(e, TempestUnavailable) else type(e).__name__
+            gap = f"Lightning sensor at {src.label} not checked this run ({why})"
+            log(f"lightning {src.label} unavailable: {why}")
+            continue
+        checked, gap = True, None
+        if r["closest_mi"] is None:
+            line = f"Lightning: none detected in the last {hold_min:g} min ({src.label})"
+        else:
+            ago = (now_epoch - r["closest_epoch"]) / 60
+            line = (f"Lightning: closest strike {r['closest_mi']:.1f} mi, {ago:.0f} min ago "
+                    f"({src.label}); halt radius {stop_mi:g} mi")
+            if r["closest_mi"] <= stop_mi:
+                mem = st.get("lightning") or {}
+                if r["closest_epoch"] >= mem.get("epoch", 0):
+                    st["lightning"] = {"epoch": r["closest_epoch"], "mi": round(r["closest_mi"], 2),
+                                       "station": src.label}
+        break
+
+    mem = st.get("lightning")
+    if mem and now_epoch - mem["epoch"] <= hold_min * 60:
+        return (Lightning(distance_mi=mem["mi"], minutes_ago=max(0, (now_epoch - mem["epoch"]) / 60),
+                          station=mem["station"], sensor_offline=not checked), line, gap)
+    st["lightning"] = None
+    return None, line, gap
+
+
 def fetch_observation() -> tuple:
     """(best Observation or None, [(label, why it was skipped), ...])
     in the site file's priority order."""
@@ -617,16 +667,22 @@ DISCLAIMER = ("Forecast and observation based. Confirm lightning by eye and ear 
               "the 30-30 rule. This assists the call; it does not make it.")
 
 
-def build_message(lead, reasons, ctx, has_image):
+def build_message(lead, reasons, ctx, has_image, reasons_title="Reasons"):
     """(text_body, html_body) for an alert or all-clear."""
     details = [f"Forecast: {ctx['cond_line']}", ctx["obs_line"],
                f"Primary model: {ctx['source'] or 'none'}", ctx["agreement_line"]]
     if ctx["nws_names"]:
         details.append(f"NWS alerts: {', '.join(ctx['nws_names'])}")
+    if ctx.get("lightning_line"):
+        details.append(ctx["lightning_line"])
+    if ctx.get("station_lines"):
+        details.append("")
+        details.append("Every station right now:")
+        details.extend(ctx["station_lines"])
 
     text = lead
     if reasons:
-        text += "\n\nReasons:\n" + "\n".join(f"  • {r}" for r in reasons)
+        text += f"\n\n{reasons_title}:\n" + "\n".join(f"  • {r}" for r in reasons)
     if ctx["fleet_rows"]:
         text += "\n\nFleet:\n" + fleet_table_text(ctx["fleet_rows"])
     if ctx["gaps"]:
@@ -659,7 +715,9 @@ def build_message(lead, reasons, ctx, has_image):
 # State
 # ============================================================================
 def blank_state():
-    return {"version": STATE_VERSION,
+    # "briefing" belongs to briefing.py (the storm briefing); it is carried
+    # through untouched so the two programs can share one state file.
+    return {"version": STATE_VERSION, "lightning": None, "briefing": {},
             "activities": {a.id: {"level": "GO", "below_runs": 0, "below_peak": "GO"}
                            for a in SITE.activities},
             "health": {"forecast": 0, "observation": 0, "nws": 0, "degraded_notified": False}}
@@ -691,6 +749,14 @@ def load_state():
                     "level": rec["level"],
                     "below_runs": _count(rec.get("below_runs")),
                     "below_peak": rec["below_peak"] if rec.get("below_peak") in ORDER else "GO"}
+        if isinstance(raw.get("briefing"), dict):
+            st["briefing"] = raw["briefing"]
+        lt = raw.get("lightning")
+        if (isinstance(lt, dict) and isinstance(lt.get("station"), str)
+                and all(isinstance(lt.get(k), (int, float)) and not isinstance(lt.get(k), bool)
+                        for k in ("epoch", "mi"))):
+            st["lightning"] = {"epoch": float(lt["epoch"]), "mi": float(lt["mi"]),
+                               "station": lt["station"]}
         health = raw.get("health")
         for k, v in (health.items() if isinstance(health, dict) else ()):
             if k == "degraded_notified":
@@ -763,20 +829,10 @@ def ping_healthcheck(fail: bool, summary: str):
 # ============================================================================
 # Main
 # ============================================================================
-def run() -> dict:
-    """One monitor cycle. Returns a summary dict (used by tests and the log)."""
-    now = now_local()
-    ts = now.strftime("%-I:%M %p")
-    st = load_state()
-
-    if not in_operating_hours(SITE, now.hour) and not DRY_RUN:   # dry runs check any time
-        # Closed: reset to GO so a bad morning triggers a fresh alert at opening.
-        for rec in st["activities"].values():
-            rec.update(level="GO", below_runs=0, below_peak="GO")
-        save_state(st)
-        log(f"Outside operating hours ({now:%H:%M}); state reset, no checks.")
-        return {"open": False, "sent": [], "degraded": []}
-
+def gather(st: dict, now) -> tuple:
+    """Fetch everything and make the calls for this moment. Shared by the
+    monitor run and the conditions report so the two can never disagree.
+    Returns (fc, obs, nws, cond, lightning, snap, gaps, ctx, graphic)."""
     fc = fetch_forecast()
     obs, skipped = fetch_observation()
     nws = fetch_nws()
@@ -786,17 +842,24 @@ def run() -> dict:
     cond = Conditions(wind_kn=p.get("wind"), gust_kn=p.get("gust"), dir_deg=p.get("dir"),
                       precip_in_hr=p.get("precip_in_hr"), vis_mi=p.get("vis_mi"),
                       cape=p.get("cape"), storm=p.get("weather_code") in (95, 96, 99))
+    lightning, lightning_line, lightning_gap = lightning_status(st, now.timestamp())
     snap = assess(SITE, cond, obs, nws["names"], now, forecast_source=fc["source"],
-                  agreement=fc["agreement"])
+                  agreement=fc["agreement"], lightning=lightning)
     gaps = data_gap_notes(fc, obs, skipped, nws)
+    if lightning_gap:
+        gaps.append(lightning_gap)
     snap["data_gaps"] = gaps
 
     ctx = {"cond_line": conditions_line(fc["primary"], marine), "obs_line": obs_line(obs),
            "source": fc["source"], "agreement_line": agreement_line(fc["agreement"]),
-           "nws_names": nws["names"], "gaps": gaps,
+           "nws_names": nws["names"], "gaps": gaps, "lightning_line": lightning_line,
            "fleet_rows": [(f["label"], f["level"], f["reason"]) for f in snap["fleet"]]}
     log(f"Primary model: {fc['source']} | {ctx['agreement_line']}")
     log(ctx["obs_line"])
+    if lightning_line:
+        log(lightning_line)
+    if lightning_active(lightning, SITE):
+        log(f"!!! LIGHTNING HALT: {lightning.distance_mi:.1f} mi, {lightning.minutes_ago:.0f} min ago")
     for g in gaps:
         log(f"DATA GAP: {g}")
 
@@ -814,9 +877,29 @@ def run() -> dict:
                 headline=f"{SITE.area_name} conditions")
         except Exception as e:
             log(f"graphic render failed (continuing without it): {e}")
+    return fc, obs, nws, cond, lightning, snap, gaps, ctx, graphic
+
+
+def run() -> dict:
+    """One monitor cycle. Returns a summary dict (used by tests and the log)."""
+    now = now_local()
+    ts = now.strftime("%-I:%M %p")
+    st = load_state()
+
+    if not in_operating_hours(SITE, now.hour) and not DRY_RUN:   # dry runs check any time
+        # Closed: reset to GO so a bad morning triggers a fresh alert at opening.
+        for rec in st["activities"].values():
+            rec.update(level="GO", below_runs=0, below_peak="GO")
+        save_state(st)
+        log(f"Outside operating hours ({now:%H:%M}); state reset, no checks.")
+        return {"open": False, "sent": [], "degraded": []}
+
+    fc, obs, nws, cond, lightning, snap, gaps, ctx, graphic = gather(st, now)
 
     sent = []
-    have_wind = obs is not None or cond.wind_kn is not None
+    # A lightning halt goes out even if every wind source is down.
+    have_wind = (obs is not None or cond.wind_kn is not None
+                 or lightning_active(lightning, SITE))
     if not have_wind:
         log("!!! No wind data from any source — holding the last call, no changes sent.")
     else:
@@ -897,6 +980,59 @@ def main():
                      json.dumps({k: summary.get(k) for k in ("open", "sent", "degraded", "gaps")}))
 
 
+def station_lines() -> list:
+    """One plain line per switched-on station, for the conditions report."""
+    out = []
+    for src in SITE.observation_sources:
+        fn = OBS_FETCHERS.get(src.type)
+        try:
+            if fn is None:
+                raise SourceError(f"unsupported source type '{src.type}'")
+            o = fn(src)
+        except (SourceError, KeyError, ValueError) as e:
+            out.append(f"  {src.label}: not available ({e})")
+            continue
+        gust = f" g{round(o.gust_kn)}" if o.gust_kn is not None else " (no gust reading)"
+        out.append(f"  {src.label}: {kn(o.wind_kn)} kn{gust} {compass(o.dir_deg)} "
+                   f"({round(o.age_min)} min ago)")
+    return out
+
+
+def conditions_report() -> int:
+    """`python monitor.py --report`: run every real check and EMAIL the full
+    picture as a clearly-marked test. Changes no stored status, sends no texts,
+    and never counts as an alert. Works outside operating hours too."""
+    now = now_local()
+    ts = now.strftime("%-I:%M %p")
+    st = load_state()
+    fc, obs, nws, cond, lightning, snap, gaps, ctx, graphic = gather(st, now)
+    reasons = []
+    for act in snap["activities"]:
+        why = "; ".join(act["headline_reasons"][:3]) or "within limits"
+        line = f"{act['label']}: {act['word']} — {why}"
+        stored = st["activities"][act["id"]]["level"]
+        if stored != act["level"]:
+            line += f" (last alert sent to staff: {LEVEL_WORD[stored]})"
+        reasons.append(line)
+    ctx["station_lines"] = station_lines()
+    tag = SITE.short_name
+    subject = f"🧪 {tag} conditions report (test) — {ts}"
+    lead = (f"TEST REPORT — current conditions at {SITE.area_name} as of {now:%a %b %-d}, {ts}. "
+            f"This is a manual test run: no status was changed and no alert was triggered.")
+    text, html = build_message(lead, reasons, ctx, graphic is not None,
+                               reasons_title="Current calls")
+    print(text)
+    if DRY_RUN:
+        log("[DRY RUN] report not emailed")
+        return 0
+    sent = send_email(subject, text, html, graphic)
+    if sent is True:
+        return 0
+    log("!!! Report email was not sent — " +
+        ("email is not configured" if sent is None else "the mail server refused it"))
+    return 1
+
+
 def station_report() -> int:
     """`python monitor.py --stations`: every station in the site file, side by
     side, including ones switched off. Reads only: no alerts, no state change."""
@@ -926,6 +1062,39 @@ def station_report() -> int:
             note += f" day peak {o.peak_gust_kn:.0f} kn"
         print(f"{i:>2}  {src.label:<34} {o.wind_kn:>4.0f} kn {gust:>7} {compass(o.dir_deg):>5} "
               f"{o.age_min:>4.0f} min  {note}")
+    # Candidates: what else Weather Underground has near the dock, with a live
+    # reading for each one not already in the settings file.
+    if nearby_stations is not None:
+        import math
+        have = {str(s.params.get("station", "")).upper() for s in site.observation_sources}
+        print("\nOther Weather Underground stations near the dock (not in the settings file):")
+        try:
+            near = [n for n in nearby_stations(site.lat, site.lon, session=HTTP)
+                    if n["id"].upper() not in have][:12]
+            if not near:
+                print("  none listed")
+            for n in near:
+                where = ""
+                if n["lat"] is not None and n["lon"] is not None:
+                    dy = n["lat"] - site.lat
+                    dx = (n["lon"] - site.lon) * math.cos(math.radians(site.lat))
+                    where = f"{compass(math.degrees(math.atan2(dx, dy)) % 360)} of dock"
+                dist = "" if n["miles"] is None else f"{n['miles']:.1f} mi"
+                try:
+                    w = fetch_wu(n["id"], session=HTTP)
+                    age = (time.time() - w["observed_epoch"]) / 60
+                    g = "none" if w["gust_kn"] is None else f"{w['gust_kn']:.0f} kn"
+                    live = (f"{w['wind_kn']:.0f} kn, gust {g}, from {compass(w['wind_dir_deg'])}, "
+                            f"{age:.0f} min ago, elev {w['elev_ft'] if w['elev_ft'] is not None else '?'} ft")
+                except Exception as e:
+                    live = f"no reading ({e if isinstance(e, WUUnavailable) else type(e).__name__})"
+                print(f"  {n['id']:<12} {str(n['name'] or '')[:28]:<28} {dist:>7} {where:<12} {live}")
+        except Exception as e:
+            print(f"  could not list them ({e if isinstance(e, WUUnavailable) else type(e).__name__})")
+
+    if site.shared.lightning_stop_mi is not None:
+        _, line, gap = lightning_status({"lightning": None}, time.time())
+        print("\n" + (line or gap or "Lightning: not checked"))
     print(f"\n{ok} of {len(site.observation_sources)} stations answered. "
           f"The monitor uses the first one in this list that answers and isn't switched off.")
     return 0 if ok else 1
@@ -934,4 +1103,6 @@ def station_report() -> int:
 if __name__ == "__main__":
     if "--stations" in sys.argv[1:]:
         sys.exit(station_report())
+    if "--report" in sys.argv[1:]:
+        sys.exit(conditions_report())
     main()
