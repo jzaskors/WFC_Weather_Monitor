@@ -57,6 +57,7 @@ jobs:
           EMAIL_FROM:      ${{ secrets.EMAIL_FROM }}
           EMAIL_TO:        ${{ secrets.EMAIL_TO }}
           BRIEFING_TO:     ${{ secrets.BRIEFING_TO }}
+          TEMPEST_TOKEN:   ${{ secrets.TEMPEST_TOKEN }}
           EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME }}
           EMAIL_REPLY_TO:  ${{ secrets.EMAIL_REPLY_TO }}
         run: |
