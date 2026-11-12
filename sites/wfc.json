@@ -57,10 +57,10 @@
 
   "observation_sources": [
     { "id": "wfc_tempest", "type": "tempest", "label": "WFC dock (Tempest)",
-      "station_id": 61040, "auth": "token",
+      "station_id": 238215, "auth": "token",
       "exposure_offset_kn": 0, "max_age_min": 15, "has_live_gust": true,
       "enabled": true,
-      "note": "Re-mounted outside Nov 7, 2026. If it is ever taken down or brought indoors, set enabled to false — indoors it reads calm, which would read as an all-clear." },
+      "note": "Re-mounted outside Nov 7, 2026; the re-setup moved it from old station 61040 to 238215. If it is ever taken down or brought indoors, set enabled to false — indoors it reads calm, which would read as an all-clear." },
     { "id": "sagamore", "type": "weatherlink_embed", "label": "Sagamore YC (in harbor)",
       "embed_id": "e9aef99860fc4aecb73f08d0d9cb3e37",
       "exposure_offset_kn": 0, "max_age_min": 20, "has_live_gust": false },
