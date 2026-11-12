@@ -256,6 +256,75 @@ def fetch_tempest(station_id, auth: str = "public",
             raise TempestUnavailable(f"{first}; then {second}") from second
 
 
+# --- Lightning ------------------------------------------------------------
+# The Tempest has a lightning sensor. Two readings are combined so a close
+# strike can't be hidden by a later, more distant one:
+#   1. the station's "last strike" (distance + time), and
+#   2. the sensor's minute-by-minute record over the window (needs device_id):
+#      each 1-minute row carries a strike count and the average distance.
+# Distances are the sensor's own estimates, in km, and are approximate.
+KM_TO_MI = 0.621371
+DEVICE_OBS = "https://swd.weatherflow.com/swd/rest/observations/device/"
+SENSOR_SILENT_SECONDS = 20 * 60     # no report for this long = sensor offline
+_I_EPOCH, _I_STRIKE_KM, _I_STRIKE_COUNT = 0, 14, 15     # obs_st row layout
+
+
+def fetch_lightning(station_id, auth: str = "token", device_id=None, window_min: float = 30,
+                    session: Optional[requests.Session] = None,
+                    now: Optional[float] = None) -> dict:
+    """Closest strike inside the last window_min minutes.
+
+    Returns {"closest_mi": float|None, "closest_epoch": float|None,
+             "strikes": int, "minute_history": bool}. closest_mi None = no
+    strike in the window. Raises TempestUnavailable when the sensor can't be
+    read or has gone quiet, so the caller never mistakes silence for clear sky.
+    """
+    now = time.time() if now is None else now
+    since = now - window_min * 60
+    raw = fetch_raw(station_id, auth, session)
+    status = raw.get("status") or {}
+    if status.get("status_code", 0) != 0:
+        raise TempestUnavailable(f"API status {status.get('status_code')}: {status.get('status_message')}")
+    obs_list = raw.get("obs") or []
+    if not obs_list:
+        raise TempestUnavailable("station returned no observations (offline?)")
+    o = obs_list[0]
+    ts = _num(o.get("timestamp"))
+    if ts is None or now - ts > SENSOR_SILENT_SECONDS:
+        age = "unknown" if ts is None else f"{(now - ts) / 60:.0f} min"
+        raise TempestUnavailable(f"sensor has not reported recently (last report {age} ago)")
+
+    hits = []                                   # (km, epoch)
+    last_epoch, last_km = _num(o.get("lightning_strike_last_epoch")), _num(o.get("lightning_strike_last_distance"))
+    if last_epoch is not None and last_km is not None and since <= last_epoch <= now + MAX_FUTURE_SECONDS:
+        hits.append((last_km, last_epoch))
+
+    minute_history = False
+    if device_id:
+        http = session or requests
+        try:
+            r = http.get(f"{DEVICE_OBS}{int(device_id)}",
+                         params=dict(_auth_params(auth), time_start=int(since), time_end=int(now)),
+                         timeout=REQUEST_TIMEOUT_SECONDS)
+            r.raise_for_status()
+            for row in (r.json().get("obs") or []):
+                if not isinstance(row, list) or len(row) <= _I_STRIKE_COUNT:
+                    continue
+                count, km, ep = _num(row[_I_STRIKE_COUNT]), _num(row[_I_STRIKE_KM]), _num(row[_I_EPOCH])
+                if count and km is not None and ep is not None and ep >= since:
+                    hits.append((km, ep))
+            minute_history = True
+        except Exception:
+            minute_history = False              # the last-strike reading above still stands
+
+    if not hits:
+        return {"closest_mi": None, "closest_epoch": None, "strikes": 0,
+                "minute_history": minute_history}
+    km, ep = min(hits, key=lambda h: (h[0], -h[1]))
+    return {"closest_mi": km * KM_TO_MI, "closest_epoch": ep, "strikes": len(hits),
+            "minute_history": minute_history}
+
+
 def account_report(token: str) -> None:
     """Diagnostic: every station and device on the token's account, with each
     device's latest reading. Shows whether the sensor moved to a new station ID."""
