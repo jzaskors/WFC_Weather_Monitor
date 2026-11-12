@@ -187,7 +187,8 @@ def _positive_int(d: dict, key: str, default: int) -> int:
     return v
 
 
-_SOURCE_KEYS = {"id", "type", "label", "exposure_offset_kn", "max_age_min", "has_live_gust"}
+_SOURCE_KEYS = {"id", "type", "label", "exposure_offset_kn", "max_age_min", "has_live_gust",
+                "enabled", "note"}
 
 
 def site_from_dict(d: dict) -> Site:
@@ -204,6 +205,11 @@ def site_from_dict(d: dict) -> Site:
 
     sources = []
     for s in d.get("observation_sources", []):
+        # "enabled": false keeps a station on file without polling it (e.g. a
+        # sensor that isn't mounted yet). It is dropped here, so it never shows
+        # up in alerts as a "skipped" backup.
+        if s.get("enabled", True) is False:
+            continue
         sources.append(ObservationSource(
             id=s["id"], type=s["type"], label=s.get("label", s["id"]),
             exposure_offset_kn=s.get("exposure_offset_kn", 0),
