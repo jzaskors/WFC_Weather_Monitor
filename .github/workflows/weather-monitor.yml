@@ -43,6 +43,27 @@ jobs:
           TEMPEST_API_KEY: ${{ secrets.TEMPEST_API_KEY }}
           WU_API_KEY:      ${{ secrets.WU_API_KEY }}
         run: python monitor.py
+      # Storm briefing: looks 3 days ahead, twice a day, and emails only when the
+      # models agree on strong wind. Its own step so it can never block an alert.
+      - name: Storm briefing (twice a day)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 4
+        env:
+          SMTP_HOST:       ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:       ${{ secrets.SMTP_PORT }}
+          SMTP_USER:       ${{ secrets.SMTP_USER }}
+          SMTP_PASS:       ${{ secrets.SMTP_PASS }}
+          EMAIL_FROM:      ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:        ${{ secrets.EMAIL_TO }}
+          BRIEFING_TO:     ${{ secrets.BRIEFING_TO }}
+          EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME }}
+          EMAIL_REPLY_TO:  ${{ secrets.EMAIL_REPLY_TO }}
+        run: |
+          if python briefing.py --due; then
+            pip install -q matplotlib
+            python briefing.py --auto
+          fi
       # Always save state — even if the check step crashed — so a sent alert is
       # never forgotten and re-sent. Retries if another run pushed first.
       - name: Persist state
