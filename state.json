@@ -2,7 +2,7 @@
   "version": 2,
   "lightning": null,
   "briefing": {
-    "slot": "2026-11-12-06",
+    "slot": "2026-11-12-15",
     "try_slot": null,
     "tries": 0
   },
@@ -14,7 +14,7 @@
     },
     "sail": {
       "level": "CAUTION",
-      "below_runs": 1,
+      "below_runs": 0,
       "below_peak": "GO"
     }
   },
