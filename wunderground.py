@@ -144,6 +144,36 @@ def fetch_wu(station: str, session: Optional[requests.Session] = None) -> dict:
     return parse_wu(fetch_raw(station, session))
 
 
+NEAR_ENDPOINT = "https://api.weather.com/v3/location/near"
+
+
+def nearby_stations(lat: float, lon: float, session: Optional[requests.Session] = None) -> list:
+    """Weather Underground's own list of the stations nearest a point:
+    [{"id", "name", "lat", "lon", "miles"}, ...] nearest first. Used by the
+    station check to find candidates; the monitor itself never calls this."""
+    http = session or requests
+    try:
+        r = http.get(NEAR_ENDPOINT, timeout=REQUEST_TIMEOUT_SECONDS,
+                     params={"geocode": f"{lat:.4f},{lon:.4f}", "product": "pws",
+                             "format": "json", "apiKey": _key()})
+    except requests.RequestException as exc:
+        raise WUUnavailable(f"request failed ({type(exc).__name__})") from None
+    if r.status_code == 401:
+        raise WUUnavailable("HTTP 401: this key is not allowed to list nearby stations")
+    if r.status_code >= 400 or not r.content:
+        raise WUUnavailable(f"HTTP {r.status_code}")
+    try:
+        loc = (r.json() or {}).get("location") or {}
+    except ValueError:
+        raise WUUnavailable("response was not JSON") from None
+    ids = loc.get("stationId") or []
+    col = lambda k: loc.get(k) or [None] * len(ids)
+    out = [{"id": i, "name": n, "lat": _num(la), "lon": _num(lo), "miles": _num(mi)}
+           for i, n, la, lo, mi in zip(ids, col("stationName"), col("latitude"),
+                                       col("longitude"), col("distanceMi")) if i]
+    return sorted(out, key=lambda s: (s["miles"] is None, s["miles"] or 0))
+
+
 if __name__ == "__main__":
     # Diagnostic: python wunderground.py KNYOYSTE13 KNYOYSTE29
     # (for a side-by-side of every station, run: python monitor.py --stations)
