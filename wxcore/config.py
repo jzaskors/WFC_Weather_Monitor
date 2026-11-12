@@ -84,6 +84,11 @@ class SharedLimits:
     rain_stop_in_hr: float = 0.30
     cape_watch: float = 1000
     visibility_stop_mi: float = 0.5
+    # Measured lightning (from a station with a lightning sensor). A strike
+    # within lightning_stop_mi halts everything until lightning_hold_min
+    # minutes after the LAST strike inside that radius. None = rule off.
+    lightning_stop_mi: Optional[float] = None
+    lightning_hold_min: float = 30
 
 
 @dataclass(frozen=True)
