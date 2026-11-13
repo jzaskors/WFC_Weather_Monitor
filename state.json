@@ -13,8 +13,8 @@
       "below_peak": "GO"
     },
     "sail": {
-      "level": "CAUTION",
-      "below_runs": 1,
+      "level": "GO",
+      "below_runs": 0,
       "below_peak": "GO"
     }
   },
