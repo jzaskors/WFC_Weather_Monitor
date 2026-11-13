@@ -2,14 +2,14 @@
   "version": 2,
   "lightning": null,
   "briefing": {
-    "slot": "2026-11-13-06",
+    "slot": "2026-11-13-15",
     "try_slot": null,
     "tries": 0
   },
   "activities": {
     "paddle": {
       "level": "CAUTION",
-      "below_runs": 0,
+      "below_runs": 1,
       "below_peak": "GO"
     },
     "sail": {
