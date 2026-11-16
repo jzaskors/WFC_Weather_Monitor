@@ -8,7 +8,7 @@
   },
   "activities": {
     "paddle": {
-      "level": "GO",
+      "level": "CAUTION",
       "below_runs": 0,
       "below_peak": "GO"
     },
@@ -19,9 +19,9 @@
     }
   },
   "health": {
-    "forecast": 3,
+    "forecast": 0,
     "observation": 0,
     "nws": 0,
-    "degraded_notified": true
+    "degraded_notified": false
   }
 }
