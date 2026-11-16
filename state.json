@@ -2,7 +2,7 @@
   "version": 2,
   "lightning": null,
   "briefing": {
-    "slot": "2026-11-16-06",
+    "slot": "2026-11-16-15",
     "try_slot": null,
     "tries": 0
   },
@@ -19,7 +19,7 @@
     }
   },
   "health": {
-    "forecast": 0,
+    "forecast": 1,
     "observation": 0,
     "nws": 0,
     "degraded_notified": false
