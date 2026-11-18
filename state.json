@@ -19,9 +19,9 @@
     }
   },
   "health": {
-    "forecast": 2,
+    "forecast": 0,
     "observation": 0,
-    "nws": 1,
+    "nws": 0,
     "degraded_notified": false
   }
 }
