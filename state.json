@@ -19,7 +19,7 @@
     }
   },
   "health": {
-    "forecast": 7,
+    "forecast": 8,
     "observation": 0,
     "nws": 0,
     "degraded_notified": true
