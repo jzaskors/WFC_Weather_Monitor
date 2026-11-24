@@ -2,12 +2,12 @@
   "version": 2,
   "lightning": null,
   "briefing": {
-    "slot": "2026-11-23-15",
+    "slot": "2026-11-24-06",
     "try_slot": null,
     "tries": 0,
     "sent": {
       "start": "2026-11-26T11:00-05:00",
-      "end": "2026-11-26T16:00-05:00",
+      "end": "2026-11-27T02:00-05:00",
       "peak": 23,
       "updates": 0
     }
