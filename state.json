@@ -14,12 +14,12 @@
   },
   "activities": {
     "paddle": {
-      "level": "GO",
+      "level": "STOP",
       "below_runs": 0,
       "below_peak": "GO"
     },
     "sail": {
-      "level": "GO",
+      "level": "STOP",
       "below_runs": 0,
       "below_peak": "GO"
     }
