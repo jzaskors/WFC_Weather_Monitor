@@ -15,7 +15,7 @@
   "activities": {
     "paddle": {
       "level": "CAUTION",
-      "below_runs": 0,
+      "below_runs": 1,
       "below_peak": "GO"
     },
     "sail": {
@@ -25,7 +25,7 @@
     }
   },
   "health": {
-    "forecast": 2,
+    "forecast": 0,
     "observation": 0,
     "nws": 0,
     "degraded_notified": false
