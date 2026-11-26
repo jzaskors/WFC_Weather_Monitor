@@ -27,7 +27,7 @@
   "health": {
     "forecast": 0,
     "observation": 0,
-    "nws": 0,
+    "nws": 1,
     "degraded_notified": false
   }
 }
